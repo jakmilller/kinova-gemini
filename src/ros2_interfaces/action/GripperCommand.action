@@ -1,0 +1,8 @@
+# Goal
+float32 position
+---
+# Result
+bool success
+---
+# Feedback
+float32 current_position

@@ -1,0 +1,5 @@
+.env
+build/
+install/
+log/
+src/kortex_controller/kortex_api

@@ -1,0 +1,1 @@
+/home/mcrr-lab/kinova-gemini/src/scripts/robot_controller_ros2.py

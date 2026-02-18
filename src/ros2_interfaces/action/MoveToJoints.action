@@ -1,0 +1,8 @@
+# Goal
+float64[] joint_angles
+---
+# Result
+bool success
+---
+# Feedback
+float64[] remaining_distance
