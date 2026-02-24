@@ -1,28 +1,27 @@
 # Software Architecture Plan: Gemini Function Calling for Kinova Gen3
 
 ## Goal
-Implement a modular system where a user can type natural language instructions into a terminal (e.g., "Open the gripper halfway" or "Move to the home position"), and the Gemini model uses **Function Calling** to trigger ROS2 actions.
+Implement a modular system where a user can type natural language instructions into a terminal, and the **gemini-robotics-er** model uses **Function Calling** to trigger ROS2 actions and vision-based tasks.
 
 ## Proposed Architecture
-
-This plan uses a ROS2-centric approach to ensure that future inputs (like voice) or outputs (like vision-guided coordinates) can be integrated as separate, interchangeable nodes.
 
 ### 1. New Package: `gemini_robotics` (Python)
 This will be the central "Brain" of the integration.
 
 *   **`gemini_brain_node.py`**:
-    *   **Gemini Client**: Manages communication with the Google GenAI SDK.
-    *   **Tool Definitions**: Contains the JSON schemas for the functions Gemini can call (e.g., `move_to_joints(angles)`, `set_gripper(position)`).
-    *   **Function Executor**: A bridge that maps Gemini's "Function Call" responses to actual calls to the `KinovaRobotControllerROS2` client (already in `src/scripts`).
-    *   **Instruction Subscriber**: Listens to a topic (e.g., `/user_instructions`) for raw text strings.
+    *   **Gemini Client**: Manages communication with the Google GenAI SDK (using `gemini-robotics-er`).
+    *   **Tool Definitions**:
+        *   `move_to_joints(angles)`: Physical actuation.
+        *   `set_gripper(position)`: End-effector control.
+        *   `locate_object(description)`: **(New)** Triggers the vision pipeline.
+    *   **Function Executor**: Maps responses to `KinovaRobotControllerROS2` or the internal Vision Pipeline.
+    *   **Instruction Subscriber**: Listens to `/user_instructions`.
 
 ### 2. Input Node: `text_interface_node.py`
-*   **Purpose**: A simple CLI for manual testing.
-*   **Function**: Uses Python's `input()` to capture user text and publishes it to the `/user_instructions` topic.
-*   **Future Modularity**: When you are ready for voice, you can create a `voice_interface_node.py` that uses a Speech-to-Text library to publish to that same topic. No changes would be needed in the "Brain" node.
+*   **Purpose**: CLI for manual testing. Publishes to `/user_instructions`.
 
 ### 3. Execution Node: `kortex_controller` (Existing C++)
-*   **Role**: Remains the low-level executor. It provides the ROS2 Action Servers that the Python nodes interact with.
+*   **Role**: Low-level executor (ROS2 Action Servers).
 
 ---
 
@@ -35,11 +34,20 @@ This will be the central "Brain" of the integration.
     
     subgraph "Gemini Brain Node"
         Brain -->|Prompt + Tool Definitions| GeminiAPI[Gemini API]
-        GeminiAPI -->|Return Function Call| Executor[Function Executor]
-        Executor -->|Call Action Client| Controller[Robot Controller Client]
+        GeminiAPI -->|Decide: Tool Call| Executor[Function Executor]
+        
+        %% Physical Action Branch
+        Executor -->|Tool: move_to_joints / set_gripper| Controller[Robot Controller Client]
+        
+        %% Vision Branch
+        Executor -->|Tool: locate_object| VisionOp[Vision Pipeline]
+        VisionOp -->|Capture RGB + Depth| RealSense[RealSense Camera]
+        VisionOp -->|RGB Image| GeminiAPI
+        GeminiAPI -.->|2D Bounding Box| VisionOp
+        VisionOp -.->|3D Coordinates| Brain
     end
 
-    Controller -->|Action Goal: MoveToJoints| Kortex(Kortex Controller Node)
+    Controller -->|Action Goal| Kortex(Kortex Controller Node)
     Kortex -->|Kortex API| Robot[Physical Kinova Robot]
     
     Robot -.->|Status| Kortex
@@ -50,20 +58,37 @@ This will be the central "Brain" of the integration.
 
 ---
 
-## Execution Flow Example
+## Execution Flow Examples
 
-1.  **User Types**: "Move to the home position."
-2.  **CLI Node**: Publishes the string `"Move to the home position"` to `/user_instructions`.
-3.  **Brain Node**:
-    *   Receives the string and sends it to Gemini along with the defined tools.
-    *   Gemini identifies that this matches the `move_to_joints` tool.
-    *   Gemini returns a function call: `move_to_joints(joint_angles=[359.9, 4.3, ...])`.
-4.  **Function Executor**: Receives the function call and executes `await controller.move_to_joints(...)`.
-5.  **Kortex Node**: Receives the ROS2 action goal, moves the physical arm, and returns a "Success" result.
-6.  **Brain Node**: Prints `[INFO] Movement successful.` to the terminal.
+### Example 1: Simple Movement
+1.  **User**: "Move to home."
+2.  **Gemini**: Calls `move_to_home()`.
+3.  **Executor**: Triggers robot action.
 
-## Why This Works for You
-- **Responsive**: No waiting for a second API call after the robot finishes moving.
-- **Modular**: The "How I get instructions" (Text vs. Voice) is separated from "How I reason" (Gemini) and "How I move" (Kortex).
-- **Simple to Start**: You don't need to touch the complex C++ code or the Vision transforms yet.
-- **Scalable**: When you add `move_to_pose` later, you just add one new "Tool" to the Brain node.
+### Example 2: Vision-Guided Task
+1.  **User**: "Pick up the plate."
+2.  **Gemini**: "I need coordinates. Calling `locate_object('plate')`."
+3.  **Vision Pipeline**:
+    *   Captures 1 RGB frame + Aligned Depth.
+    *   Sends RGB to `gemini-robotics-er`.
+    *   Gemini returns 2D bounding box.
+    *   Pipeline calculates center pixel $(u, v)$ and looks up depth $Z$.
+    *   Returns 3D coordinates $(x, y, z)$ (Camera Frame).
+4.  **Gemini**: Receives coordinates. Calls `move_to_pose(x, y, z)`.
+5.  **Executor**: Triggers robot motion.
+
+---
+
+## Vision Integration Strategy
+**Strategy: "Tool-Based Vision"**
+To minimize latency, we will **not** send a continuous video feed. Vision is a tool called on-demand.
+
+*   **Model**: `gemini-robotics-er` (Handles both reasoning and vision).
+*   **Workflow**:
+    1.  **Capture**: `gemini_brain_node` triggers RealSense wrapper for a single frame.
+    2.  **Query**: Image sent to Gemini with prompt: *"Locate the [description]. Return bounding box."*
+    3.  **Depth Lookup**: Use aligned depth map at the center pixel.
+    4.  **Projection**: Convert Pixel + Depth $\to$ 3D Point (Camera Frame).
+    5.  **Action**: Return 3D point to the Brain for decision making.
+
+*   **Note on Transforms**: Initially, coordinates will be relative to the **camera**. We will implement TF (Base $\to$ Camera) later.

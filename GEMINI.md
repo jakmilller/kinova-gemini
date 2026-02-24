@@ -48,6 +48,23 @@ You need three terminals (each sourced with `source install/setup.bash`):
    ```bash
    ros2 run gemini_robotics text_interface
    ```
+4. **RealSense Camera**
+   ```bash
+   ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+   ```
+   While not necessary for `move_to_joint` or `set_gripper` commands, running this command exposes these ROS2 topics from the RealSense camera:
+   ```bash
+   /camera/camera/aligned_depth_to_color/camera_info
+   /camera/camera/aligned_depth_to_color/image_raw
+   /camera/camera/color/camera_info
+   /camera/camera/color/image_raw
+   /camera/camera/color/metadata
+   /camera/camera/depth/camera_info
+   /camera/camera/depth/image_rect_raw
+   /camera/camera/depth/metadata
+   /camera/camera/extrinsics/depth_to_color
+   ```
+
 
 ## Architecture
 
