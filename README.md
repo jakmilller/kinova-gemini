@@ -1,6 +1,6 @@
-# Gemini Vision Integration for Kinova Gen3
+# Gemini VLM Integration for Kinova Gen3
 
-This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini models (`gemini-robotics-er-1.5-preview`) for natural language and vision-guided robotics tasks. The robot uses an attached Intel RealSense camera and a Robotiq 2F-140 gripper.
+This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini-Robotics-ER model (`gemini-robotics-er-1.5-preview`) for natural language and vision-guided robotics tasks. The robot uses an attached Intel RealSense camera and a Robotiq 2F-140 gripper.
 
 Users can type natural language instructions, and the Gemini model will decode the intent into a series of function calls (ROS 2 actions) for movement, gripper control, and vision-based object location.
 
