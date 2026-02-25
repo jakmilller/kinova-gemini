@@ -7,6 +7,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 
 // Kortex API
 #include <BaseClientRpc.h>
@@ -56,6 +57,7 @@ private:
 
     // Publishers and Timers
     rclcpp::Publisher<ros2_interfaces::msg::RobotState>::SharedPtr mPubState;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr mPubJointState;
     rclcpp::TimerBase::SharedPtr mTimer;
 
     // Callbacks

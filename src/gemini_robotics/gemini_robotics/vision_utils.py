@@ -250,3 +250,47 @@ def plot_segmentation_masks(
   
   img.show()
   return img
+
+def get_3d_point_from_pixel(x_pixel, y_pixel, depth, camera_info):
+  """
+  Converts 2D pixel coordinates and depth to a 3D point in the camera frame.
+  depth should be in meters.
+  """
+  fx = camera_info.k[0]
+  cx = camera_info.k[2]
+  fy = camera_info.k[4]
+  cy = camera_info.k[5]
+
+  z = depth
+  x = (x_pixel - cx) * z / fx
+  y = (y_pixel - cy) * z / fy
+
+  return x, y, z
+
+def transform_point(point_x, point_y, point_z, transform_stamped):
+  """
+  Transforms a 3D point using a geometry_msgs/TransformStamped.
+  """
+  # Extract translation
+  tx = transform_stamped.transform.translation.x
+  ty = transform_stamped.transform.translation.y
+  tz = transform_stamped.transform.translation.z
+
+  # Extract rotation (quaternion)
+  rx = transform_stamped.transform.rotation.x
+  ry = transform_stamped.transform.rotation.y
+  rz = transform_stamped.transform.rotation.z
+  rw = transform_stamped.transform.rotation.w
+
+  import numpy as np
+  v = np.array([point_x, point_y, point_z])
+  u = np.array([rx, ry, rz])
+  s = rw
+
+  # Quaternion math for rotation
+  v_prime = v + 2.0 * np.cross(u, np.cross(u, v) + s * v)
+  
+  # Add translation
+  v_prime += np.array([tx, ty, tz])
+
+  return float(v_prime[0]), float(v_prime[1]), float(v_prime[2])

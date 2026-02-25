@@ -10,50 +10,43 @@ This will be the central "Brain" of the integration.
 
 *   **`gemini_brain_node.py`**:
     *   **Gemini Client**: Manages communication with the Google GenAI SDK (using `gemini-robotics-er`).
-    *   **Tool Definitions**:
-        *   `move_to_joints(angles)`: Physical actuation.
-        *   `set_gripper(position)`: End-effector control.
-        *   `locate_object(description)`: **(New)** Triggers the vision pipeline.
-    *   **Function Executor**: Maps responses to `KinovaRobotControllerROS2` or the internal Vision Pipeline.
-    *   **Instruction Subscriber**: Listens to `/user_instructions`.
+    *   **Tool Definitions (Gemini-Callable Functions)**:
+        *   `move_to_joints(joint_angles)`: Moves the 7 DOF arm to specific joint angles (in degrees). Used for hardcoded or precisely known configurations.
+        *   `set_gripper(position)`: Opens or closes the Robotiq 2F-140 gripper. Position is a value from 0 (fully open) to 100 (fully closed).
+        *   `move_to_home()`: A convenience function that commands the robot to return to a predefined safe "home" configuration defined in `config.yaml`.
+        *   `move_to_object(description)`: Triggers the complete vision-to-action pipeline. It uses the RealSense camera to capture RGB-D images, asks Gemini to segment the object described by the `description` string, calculates the object's 3D coordinate relative to the base, and automatically moves the robot's end-effector to that location.
+    *   **Function Executor**: Maps Gemini's requested function calls to the ROS 2 Action Client (`KinovaRobotControllerROS2`) or executes the internal Vision Pipeline.
+    *   **Instruction Subscriber**: Listens to the `/user_instructions` ROS 2 topic for user commands.
 
 ### 2. Input Node: `text_interface_node.py`
-*   **Purpose**: CLI for manual testing. Publishes to `/user_instructions`.
+*   **Purpose**: CLI for manual testing and interaction. Captures text input from the user and publishes it to the `/user_instructions` topic.
 
 ### 3. Execution Node: `kortex_controller` (Existing C++)
-*   **Role**: Low-level executor (ROS2 Action Servers).
+*   **Role**: Low-level executor hosting ROS 2 Action Servers (`MoveToPose`, `MoveToJoints`, `GripperCommand`). Connects directly to the Kinova robot via the Kortex API over TCP.
 
 ---
 
 ## Workflow Diagram
 
 ```mermaid
-    graph TD
-    User[User at Terminal] -->|Type Instruction| CLI(CLI Interface Node)
-    CLI -->|Publish: '/user_instructions'| Brain{Gemini Brain Node}
-    
-    subgraph "Gemini Brain Node"
-        Brain -->|Prompt + Tool Definitions| GeminiAPI[Gemini API]
-        GeminiAPI -->|Decide: Tool Call| Executor[Function Executor]
-        
-        %% Physical Action Branch
-        Executor -->|Tool: move_to_joints / set_gripper| Controller[Robot Controller Client]
-        
-        %% Vision Branch
-        Executor -->|Tool: locate_object| VisionOp[Vision Pipeline]
-        VisionOp -->|Capture RGB + Depth| RealSense[RealSense Camera]
-        VisionOp -->|RGB Image| GeminiAPI
-        GeminiAPI -.->|2D Bounding Box| VisionOp
-        VisionOp -.->|3D Coordinates| Brain
+graph TD
+    subgraph Inputs
+        User((User)) -->|Types Command| CLI[text_interface_node]
+        Camera[RealSense Camera] -->|RGB & Depth Streams| Brain[gemini_brain_node]
+        RobotState[Robot Feedback] -->|Current Pose & Joints| Brain
     end
 
-    Controller -->|Action Goal| Kortex(Kortex Controller Node)
-    Kortex -->|Kortex API| Robot[Physical Kinova Robot]
-    
-    Robot -.->|Status| Kortex
-    Kortex -.->|Success/Failure| Controller
-    Controller -.->|Result| Brain
-    Brain -.->|Print Status| User
+    subgraph Intelligence
+        CLI -->|/user_instructions| Brain
+        Brain <-->|Prompts & Images <br/> Function Calling| GeminiAPI[Google Gemini API]
+        Brain <-->|Pixel-to-3D Math <br/> & TF Transforms| Vision[vision_utils.py]
+    end
+
+    subgraph Execution
+        Brain -->|ROS 2 Actions| Client[robot_controller_ros2.py]
+        Client -->|ROS 2 Actions| Kortex[kortex_controller C++]
+        Kortex -->|Hardware API| Robot[Kinova Gen3 Robot]
+    end
 ```
 
 ---
@@ -61,34 +54,35 @@ This will be the central "Brain" of the integration.
 ## Execution Flow Examples
 
 ### Example 1: Simple Movement
-1.  **User**: "Move to home."
-2.  **Gemini**: Calls `move_to_home()`.
-3.  **Executor**: Triggers robot action.
+1.  **User**: "Move to home and open the gripper."
+2.  **Gemini**: Analyzes the request and sequentially calls `move_to_home()` and `set_gripper(position: 0)`.
+3.  **Executor**: Triggers the respective robot actions via the `KinovaRobotControllerROS2` action client.
 
 ### Example 2: Vision-Guided Task
-1.  **User**: "Pick up the plate."
-2.  **Gemini**: "I need coordinates. Calling `locate_object('plate')`."
+1.  **User**: "Move the arm over to the blue block."
+2.  **Gemini**: Recognizes a spatial target and calls `move_to_object(description: 'blue block')`.
 3.  **Vision Pipeline**:
-    *   Captures 1 RGB frame + Aligned Depth.
-    *   Sends RGB to `gemini-robotics-er`.
-    *   Gemini returns 2D bounding box.
-    *   Pipeline calculates center pixel $(u, v)$ and looks up depth $Z$.
-    *   Returns 3D coordinates $(x, y, z)$ (Camera Frame).
-4.  **Gemini**: Receives coordinates. Calls `move_to_pose(x, y, z)`.
-5.  **Executor**: Triggers robot motion.
+    *   Waits for and captures synchronized RGB and Aligned Depth frames from the RealSense topics.
+    *   Sends the RGB image and a prompt requesting a segmentation mask for 'blue block' to the Gemini API.
+    *   Gemini returns the segmentation mask coordinates as JSON.
+    *   The pipeline overlays the mask on the depth image and calculates the **median depth** of the segmented object to ignore noise or outliers.
+    *   Calculates the centroid pixel $(u, v)$ of the mask.
+    *   Uses RealSense camera intrinsics (focal length, principal point) to project the pixel and depth into a 3D coordinate $(X, Y, Z)$ in the `realsense_link` frame.
+    *   Uses ROS 2 TF2 (`tf_buffer.lookup_transform`) to transform the 3D coordinate from `realsense_link` to the robot's `base_link`.
+    *   Sends a `MoveToPose` action goal to the controller with the new base coordinates, maintaining the current end-effector orientation.
+4.  **Executor**: Triggers the robot motion to the object.
 
 ---
 
 ## Vision Integration Strategy
 **Strategy: "Tool-Based Vision"**
-To minimize latency, we will **not** send a continuous video feed. Vision is a tool called on-demand.
+To minimize latency and token usage, we do **not** send a continuous video feed to the model. Vision is treated as a tool, invoked on-demand when spatial understanding is required.
 
-*   **Model**: `gemini-robotics-er` (Handles both reasoning and vision).
+*   **Model**: `gemini-robotics-er` (Handles both logical reasoning and 2D spatial extraction).
 *   **Workflow**:
-    1.  **Capture**: `gemini_brain_node` triggers RealSense wrapper for a single frame.
-    2.  **Query**: Image sent to Gemini with prompt: *"Locate the [description]. Return bounding box."*
-    3.  **Depth Lookup**: Use aligned depth map at the center pixel.
-    4.  **Projection**: Convert Pixel + Depth $\to$ 3D Point (Camera Frame).
-    5.  **Action**: Return 3D point to the Brain for decision making.
-
-*   **Note on Transforms**: Initially, coordinates will be relative to the **camera**. We will implement TF (Base $\to$ Camera) later.
+    1.  **Capture**: `gemini_brain_node` pulls the latest frame from the `/camera/...` topics.
+    2.  **Query**: The image is sent to Gemini with a prompt: *"Return segmentation masks for: [description]."*.
+    3.  **Mask Processing**: The JSON response is decoded into a bitmask and resized to match the original image resolution. 
+    4.  **Depth Lookup**: The depth values corresponding to the "True" pixels of the mask are extracted from the aligned depth image, and the median depth is computed.
+    5.  **Projection & Transform**: The 2D centroid and median depth are projected into 3D space using the camera's intrinsic parameters (dynamically subscribed via `CameraInfo`). The point is then transformed to the robot's base frame using the static TF tree.
+    6.  **Action**: A movement command is dispatched autonomously by the pipeline using the calculated coordinates.

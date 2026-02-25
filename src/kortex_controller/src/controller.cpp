@@ -58,6 +58,7 @@ Controller::Controller() : Node("kinova_controller")
 
     // --- Telemetry Pub ---
     mPubState = this->create_publisher<ros2_interfaces::msg::RobotState>("robot_state", 10);
+    mPubJointState = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
     mTimer = this->create_wall_timer(100ms, std::bind(&Controller::publishState, this));
     
     RCLCPP_INFO(this->get_logger(), "Kinova Controller Initialized");
@@ -275,20 +276,48 @@ void Controller::handle_gripper_accepted(const std::shared_ptr<GoalHandleGripper
 void Controller::publishState()
 {
     auto feedback = mBaseCyclic->RefreshFeedback();
+    
+    // --- RobotState (Custom) ---
     auto msg = ros2_interfaces::msg::RobotState();
-
-    msg.gripper_position = feedback.interconnect().gripper_feedback().motor()[0].position();
-    msg.gripper_force = feedback.interconnect().gripper_feedback().motor()[0].velocity(); 
-
     msg.x = feedback.base().tool_pose_x();
     msg.y = feedback.base().tool_pose_y();
     msg.z = feedback.base().tool_pose_z();
+    msg.theta_x = feedback.base().tool_pose_theta_x();
+    msg.theta_y = feedback.base().tool_pose_theta_y();
+    msg.theta_z = feedback.base().tool_pose_theta_z();
 
     for(int i = 0; i < 7 && i < feedback.actuators_size(); ++i) {
         msg.joint_angles[i] = feedback.actuators(i).position();
     }
     
+    float gripper_pos_0_100 = feedback.interconnect().gripper_feedback().motor()[0].position();
+    msg.gripper_position = gripper_pos_0_100;
+    
     mPubState->publish(msg);
+
+    // --- JointState (Standard for RViz) ---
+    auto joint_msg = sensor_msgs::msg::JointState();
+    joint_msg.header.stamp = this->now();
+    
+    // Standard names for Gen3 7DOF
+    joint_msg.name = {"joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "finger_joint"};
+
+    // Arm Joints
+    for(int i = 0; i < 7 && i < feedback.actuators_size(); ++i) {
+        float angle_deg = feedback.actuators(i).position();
+        float angle_rad = angle_deg * (M_PI / 180.0f);
+        joint_msg.position.push_back(angle_rad);
+    }
+
+    // Gripper Joint
+    // 0-100% -> 0.0-0.8 (approx closed)
+    // Robotiq 2F-140: 0 is Open, 140mm is Closed? No, 0 is Open in Kortex 0-100?
+    // Let's assume 0.8 scaling factor logic from old controller is correct for URDF.
+    // Logic from old controller: position() is 0-100. 
+    // joint_state.position.push_back(0.8 * position / 100.0);
+    joint_msg.position.push_back((gripper_pos_0_100 / 100.0f) * 0.8f);
+
+    mPubJointState->publish(joint_msg);
 }
 
 rclcpp_action::GoalResponse Controller::handle_pose_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const ros2_interfaces::action::MoveToPose::Goal>) {

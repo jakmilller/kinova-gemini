@@ -5,7 +5,7 @@ This project integrates a **7 DOF Kinova Gen3 robot** (using the Kortex API) wit
 ## Project Status
 - **Low-Level Control**: Fully functional ROS2 action servers in C++ for Joint, Pose, and Gripper control.
 - **Text-to-Command**: Functional natural language interface. Gemini decodes user intent into ROS2 action calls using Function Calling (Tools).
-- **Vision (WIP)**: RealSense is launchable through a ROS2 command, but pixel-to-3D coordinate transformation and Gemini Vision integration into the "Brain" node are not yet complete. Vision is necessary to complete any `move_to_pose` task (e.g. "move to the blue object" requires the Gemini model to find the object, output the desired coordinates, map the coordinates to the dimensions of the RS camera frame, get the depth at that point, and construct the desired pose command to send to the robot, taking into account the current robot pose). This will require knowledge of the robot's state through ROS2 transforms for the Kinova 7DOF Gen3 (must know the current robot pose to move to the new pose), which is not set up yet.
+- **Vision**: Pixel-to-3D coordinate transformation and Gemini Vision integration into the "Brain" node are complete. Vision is necessary to complete any `move_to_pose` task (e.g. "move to the blue object" requires the Gemini model to find the object, output the desired coordinates, map the coordinates to the dimensions of the RS camera frame, get the depth at that point, and construct the desired pose command to send to the robot, taking into account the current robot pose). This required knowledge of the robot's state through ROS2 transforms for the Kinova 7DOF Gen3 (must know the current robot pose to move to the new pose), which is now set up.
 - **Voice (WIP)**: Voice input is not yet implemented; currently uses a CLI-based text interface.
 
 
@@ -86,3 +86,4 @@ You need three terminals (each sourced with `source install/setup.bash`):
 ## User-Specific Instructions
 - I am a mechanical engineer by training, and unfamiliar with many concepts that may be obvious to software engineers. Please be sure to explain what you are doing and why you are doing it through the process so I can better learn robotics software development.
 - The Python scripts in `install/` require their shebang lines updated to point to the conda environment to find the `google-genai` library. Use the `sed` command provided in the Building section.
+- Please do not try to run shell commands (like `colcon build` or anything else), leave that to me to handle. 

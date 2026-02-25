@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>kinova_bringup</name>
+  <version>0.0.0</version>
+  <description>Launch files for Kinova robot system</description>
+  <maintainer email="your-email@todo.todo">Your Name</maintainer>
+  <license>TODO</license>
+  
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>robot_state_publisher</depend>
+
+  <!-- can maybe remove these after moveit switch -->
+  <depend>kortex_description</depend>
+  <depend>tf2_ros</depend>
+
+  <depend>kinova_gen3_7dof_robotiq_2f_85_moveit_config</depend>
+  <depend>kortex_driver</depend>
+  
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
