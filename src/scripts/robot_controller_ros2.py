@@ -22,6 +22,7 @@ class KinovaRobotControllerROS2(Node):
             self.robot_config = yaml.safe_load(f)
 
         self.home = self.robot_config['joint positions']['home']
+        self.user_position = self.robot_config['joint positions']['user']
 
         # --- Action Clients ---
         self._action_pose_client = ActionClient(self, MoveToPose, 'move_to_pose')
@@ -66,6 +67,10 @@ class KinovaRobotControllerROS2(Node):
     async def move_to_home(self):
         """Convenience function to move to the 'home' position defined in config.yaml."""
         return await self.move_to_joints(self.home)
+    
+    async def move_to_user(self):
+        """Moves the robot to a pre-defined position near the user."""
+        return await self.move_to_joints(self.user_position)
 
     async def set_gripper(self, position: float):
         """Sends a GripperCommand action goal (0-100)."""

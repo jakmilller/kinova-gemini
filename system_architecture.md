@@ -1,12 +1,12 @@
-# Software Architecture Plan: Gemini Function Calling for Kinova Gen3
+# Software Architecture: Gemini Function Calling for Kinova Gen3
 
-## Goal
-Implement a modular system where a user can type natural language instructions into a terminal, and the **gemini-robotics-er** model uses **Function Calling** to trigger ROS2 actions and vision-based tasks.
+## Overview
+This document describes the modular system architecture where a user can type natural language instructions into a terminal, and the **gemini-robotics-er** model uses **Function Calling** to trigger ROS2 actions and vision-based tasks on the Kinova Gen3 robot.
 
-## Proposed Architecture
+## Architecture
 
-### 1. New Package: `gemini_robotics` (Python)
-This will be the central "Brain" of the integration.
+### 1. Core Package: `gemini_robotics` (Python)
+The central "Brain" of the integration.
 
 *   **`gemini_brain_node.py`**:
     *   **Gemini Client**: Manages communication with the Google GenAI SDK (using `gemini-robotics-er`).
@@ -21,7 +21,7 @@ This will be the central "Brain" of the integration.
 ### 2. Input Node: `text_interface_node.py`
 *   **Purpose**: CLI for manual testing and interaction. Captures text input from the user and publishes it to the `/user_instructions` topic.
 
-### 3. Execution Node: `kortex_controller` (Existing C++)
+### 3. Execution Node: `kortex_controller` (C++)
 *   **Role**: Low-level executor hosting ROS 2 Action Servers (`MoveToPose`, `MoveToJoints`, `GripperCommand`). Connects directly to the Kinova robot via the Kortex API over TCP.
 
 ---
@@ -74,8 +74,8 @@ graph TD
 
 ---
 
-## Vision Integration Strategy
-**Strategy: "Tool-Based Vision"**
+## Vision Integration
+**"Tool-Based Vision" Approach**
 To minimize latency and token usage, we do **not** send a continuous video feed to the model. Vision is treated as a tool, invoked on-demand when spatial understanding is required.
 
 *   **Model**: `gemini-robotics-er` (Handles both logical reasoning and 2D spatial extraction).

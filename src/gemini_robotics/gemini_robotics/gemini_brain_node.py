@@ -40,7 +40,12 @@ class GeminiBrainNode(Node):
             self.system_prompt = f.read()
         
         self.client = genai.Client(api_key=os.getenv('gemini_api_key'))
-        self.model_id = self.robot_config['model']['name']
+
+        # for general tasks
+        self.flash_model_id = self.robot_config['model']['flash']
+
+        # for tasks requiring embodied reasoning/vision
+        self.robot_model_id = self.robot_config['model']['robot']
 
         # --- Robot Controller ---
         self.controller = KinovaRobotControllerROS2()
@@ -134,9 +139,18 @@ class GeminiBrainNode(Node):
             )
         )
 
+        self.move_to_user_tool = types.FunctionDeclaration(
+            name="move_to_user",
+            description="Moves the robot arm to a pre-defined position near the user. Call anytime the user mentions moving to them or bringing something to them.",
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={},
+            )
+        )
+
         self.move_to_object_tool = types.FunctionDeclaration(
             name="move_to_object",
-            description="Locates an object in the robot's view and returns its coordinates.",
+            description="Locates an object in the robot's view and navigates to it.",
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
@@ -149,7 +163,20 @@ class GeminiBrainNode(Node):
             )
         )
 
-        self.tools = [types.Tool(function_declarations=[self.move_to_joints_tool, self.set_gripper_tool, self.move_to_home_tool, self.move_to_object_tool])]
+        self.adjust_pose_tool = types.FunctionDeclaration(
+            name="adjust_pose",
+            description="Call when user requests adjusts to robot pose (e.g., 'move up a bit', 'move left slightly'). Arguments are relative adjustments in meters to current pose.",
+            parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "direction": types.Schema(type="STRING", description="Axis to adjust: 'x', 'y', or 'z'. 'x' is forward/backward, 'y' is left/right, 'z' is up/down."),
+                "amount": types.Schema(type="NUMBER", description="adjustment in meters"),
+            },
+            required=["direction", "amount"]
+            )
+        )
+
+        self.tools = [types.Tool(function_declarations=[self.move_to_joints_tool, self.set_gripper_tool, self.move_to_home_tool, self.move_to_user_tool, self.move_to_object_tool, self.adjust_pose_tool])]
         
         self.get_logger().info('Gemini Brain Node initialized and waiting for instructions...')
 
@@ -203,7 +230,7 @@ class GeminiBrainNode(Node):
 
         try:
             response = self.client.models.generate_content(
-                model=self.model_id,
+                model=self.flash_model_id,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     tools=self.tools,
@@ -216,6 +243,8 @@ class GeminiBrainNode(Node):
             for part in response.candidates[0].content.parts:
                 if part.function_call:
                     await self.execute_function(part.function_call)
+                elif part.text and part.text.strip():
+                    self.get_logger().info(f"Gemini response: {part.text.strip()}")
         
         except Exception as e:
             self.get_logger().error(f"Error during Gemini API call or execution: {str(e)}")
@@ -233,6 +262,34 @@ class GeminiBrainNode(Node):
             success = await self.controller.set_gripper(args['position'])
         elif name == "move_to_home":
             success = await self.controller.move_to_home()
+        elif name == "move_to_user":
+            success = await self.controller.move_to_user()
+        elif name == "adjust_pose":
+            if self.latest_robot_state:
+                target_x = self.latest_robot_state.x
+                target_y = self.latest_robot_state.y
+                target_z = self.latest_robot_state.z
+                direction = args.get('direction', '').lower()
+                amount = float(args.get('amount', 0.0))
+                
+                if direction == 'x':
+                    target_x += amount
+                elif direction == 'y':
+                    target_y += amount
+                elif direction == 'z':
+                    target_z += amount
+                else:
+                    self.get_logger().warn(f"Unknown direction '{direction}' for adjust_pose. Moving to current pose.")
+                
+                success = await self.controller.move_to_pose(
+                    target_x, target_y, target_z, 
+                    self.latest_robot_state.theta_x, 
+                    self.latest_robot_state.theta_y, 
+                    self.latest_robot_state.theta_z
+                )
+            else:
+                self.get_logger().error("Robot state not available. Cannot adjust pose.")
+                success = False
         elif name == "move_to_object":
             await self.move_to_object(args['description'])
             success = True # Assume success if no exception, logic inside handles logging
@@ -283,7 +340,7 @@ class GeminiBrainNode(Node):
         try:
             # We use the same client/model to query for vision
             response = self.client.models.generate_content(
-                model=self.model_id,
+                model=self.robot_model_id,
                 contents=[img_resized, prompt],
                 config=types.GenerateContentConfig(
                     temperature=0.5,

@@ -95,5 +95,13 @@ ros2 run gemini_robotics text_interface
 ## Usage Examples
 In the Text Interface terminal, you can try commands like:
 *   *"Go to the blue toy"*
+*   *"Move up 5cm"*
 *   *"Rotate the last joint 30 degrees"*
 *   *"Open the gripper slightly"*
+
+## Limitations
+Moving to objects is simplified by keeping the current end-effector orientation before and after the `move_to_pose` call. Future work should use intelligently determine the correct orientation to facilitate acquisition.
+
+This repository currently only supports simple robot movements. It does not currently support longer-horizon tasks (ex: *"Bring me the cup"* requires moving to cup, determining how to pick up, verifying acquisition, and bringing it to the user)
+
+The repo does not currently handle failures (inability to find item/confusing request).

@@ -1,6 +1,7 @@
 # configurable settings
 model:
-  name: "gemini-robotics-er-1.5-preview"
+  flash: "gemini-2.5-flash-lite"
+  robot: "gemini-robotics-er-1.5-preview"
   # other models
         # gemini-robotics-er-1.5-preview
         # gemini-2.5-flash-lite
@@ -16,3 +17,12 @@ joint positions:
     - 359.4789123535156
     - 278.1408996582031
     - 89.97930145263672
+
+  user:
+    - 9.99938678741455
+    - 15.006772994995117
+    - 180.0005645751953
+    - 229.99586486816406
+    - 359.9997863769531
+    - 54.997501373291016
+    - 90.00077819824219
