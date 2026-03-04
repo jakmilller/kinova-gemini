@@ -1,7 +1,7 @@
 # Software Architecture: Gemini Function Calling for Kinova Gen3
 
 ## Overview
-This document describes the modular system architecture where a user can type natural language instructions into a terminal, and the **gemini-robotics-er** model uses **Function Calling** to trigger ROS2 actions and vision-based tasks on the Kinova Gen3 robot.
+This document describes the modular system architecture where a user can type natural language instructions into a web interface (or terminal), and the **gemini-robotics-er** model uses **Function Calling** to trigger ROS2 actions and vision-based tasks on the Kinova Gen3 robot.
 
 ## Architecture
 
@@ -18,8 +18,8 @@ The central "Brain" of the integration.
     *   **Function Executor**: Maps Gemini's requested function calls to the ROS 2 Action Client (`KinovaRobotControllerROS2`) or executes the internal Vision Pipeline.
     *   **Instruction Subscriber**: Listens to the `/user_instructions` ROS 2 topic for user commands.
 
-### 2. Input Node: `text_interface_node.py`
-*   **Purpose**: CLI for manual testing and interaction. Captures text input from the user and publishes it to the `/user_instructions` topic.
+### 2. Input Node: Web UI & `text_interface_node.py`
+*   **Purpose**: The primary input is the interactive Web UI. A CLI (`text_interface_node.py`) is also available for manual testing. Both capture text input from the user and publish it to the `/user_instructions` topic.
 
 ### 3. Execution Node: `kortex_controller` (C++)
 *   **Role**: Low-level executor hosting ROS 2 Action Servers (`MoveToPose`, `MoveToJoints`, `GripperCommand`). Connects directly to the Kinova robot via the Kortex API over TCP.
@@ -31,13 +31,13 @@ The central "Brain" of the integration.
 ```mermaid
 graph TD
     subgraph Inputs
-        User((User)) -->|Types Command| CLI[text_interface_node]
+        User((User)) -->|Types Command| UI[Web UI / text_interface_node]
         Camera[RealSense Camera] -->|RGB & Depth Streams| Brain[gemini_brain_node]
         RobotState[Robot Feedback] -->|Current Pose & Joints| Brain
     end
 
     subgraph Intelligence
-        CLI -->|/user_instructions| Brain
+        UI -->|/user_instructions| Brain
         Brain <-->|Prompts & Images <br/> Function Calling| GeminiAPI[Google Gemini API]
         Brain <-->|Pixel-to-3D Math <br/> & TF Transforms| Vision[vision_utils.py]
     end

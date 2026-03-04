@@ -1,15 +1,15 @@
-# Gemini Vision Integration for Kinova Gen3
+# Gemini Integration for Kinova Gen3
 
 This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini models (`gemini-robotics-er-1.5-preview`) for natural language and vision-guided robotics tasks. The robot uses an attached Intel RealSense camera and a Robotiq 2F-140 gripper.
 
-Users can type natural language instructions, and the Gemini model will decode the intent into a series of function calls (ROS 2 actions) for movement, gripper control, and vision-based object location.
+Users can type natural language instructions, and the Gemini model will decode the intent into function calls (ROS 2 actions) for movement, gripper control, and vision-based object location.
 
 ## Architecture Overview
 
 The system consists of three main components:
 1.  **kortex_controller (C++)**: The core ROS 2 node executing low-level actions via the Kinova hardware API.
 2.  **gemini_robotics (Python)**: The "Brain" of the operation. Connects to the Gemini API, handles function calling, requests vision data, calculates 3D coordinates, and orchestrates the action servers.
-3.  **text_interface (Python)**: A simple CLI node for user input.
+3.  **web_UI**: A local web interface for commands.
 
 For a more detailed breakdown, refer to the [architecture plan](system_architecture.md).
 
@@ -51,7 +51,7 @@ For a more detailed breakdown, refer to the [architecture plan](system_architect
 
 ## Building
 
-Build the workspace using `colcon`. Because the Python nodes run inside a Conda environment, you must update their shebang lines after building so ROS 2 executes them with the correct Python interpreter.
+Build the workspace using `colcon`.
 
 ```bash
 # Source your ROS 2 installation
@@ -59,7 +59,12 @@ source /opt/ros/<distro>/setup.bash
 
 # Build the workspace
 colcon build --symlink-install
+```
 
+### Troubleshooting: Python Shebangs
+Because the Python nodes run inside a Conda environment, you may need to update their shebang lines after building so ROS 2 executes them with the correct Python interpreter. If you encounter module import errors (like `google-genai` not found), run the following to point the scripts to your Conda environment:
+
+```bash
 # Fix the Python shebangs to point to your Conda environment
 sed -i '1s|.*|#!/path/to/your/anaconda3/envs/kinova-gemini/bin/python3|' install/gemini_robotics/lib/gemini_robotics/*
 ```
@@ -67,15 +72,15 @@ sed -i '1s|.*|#!/path/to/your/anaconda3/envs/kinova-gemini/bin/python3|' install
 
 ## Running the System
 
-You will need three separate terminals. In each terminal, be sure to source your ROS 2 installation and your workspace overlay, and activate the conda environment:
+You will need two separate terminals. In each terminal, be sure to source your ROS 2 installation and your workspace overlay, and activate the conda environment:
 ```bash
 source /opt/ros/<distro>/setup.bash
 source install/setup.bash
 conda activate kinova-gemini
 ```
 
-**Terminal 1: Robot Description & Camera Transform**
-Launch the custom controller, robot state publisher, and RealSense camera.
+**Terminal 1: Launch Everything**
+Launch the custom controller, robot state publisher, RealSense camera, and UI dependencies.
 ```bash
 ros2 launch kinova_bringup robot.launch.py
 ```
@@ -86,14 +91,14 @@ Launch the central reasoning node.
 ros2 run gemini_robotics gemini_brain
 ```
 
-**Terminal 3: User Text Interface**
-Launch the interactive CLI to send commands.
+**Open Web Interface**
+Open the interactive web UI in a browser to send commands.
 ```bash
-ros2 run gemini_robotics text_interface
+/path/to/ws/kinova-gemini/web_ui/index.html
 ```
 
 ## Usage Examples
-In the Text Interface terminal, you can try commands like:
+In the Web Interface, you can try commands like:
 *   *"Go to the blue toy"*
 *   *"Move up 5cm"*
 *   *"Rotate the last joint 30 degrees"*
@@ -103,5 +108,3 @@ In the Text Interface terminal, you can try commands like:
 Moving to objects is simplified by keeping the current end-effector orientation before and after the `move_to_pose` call. Future work should use intelligently determine the correct orientation to facilitate acquisition.
 
 This repository currently only supports simple robot movements. It does not currently support longer-horizon tasks (ex: *"Bring me the cup"* requires moving to cup, determining how to pick up, verifying acquisition, and bringing it to the user)
-
-The repo does not currently handle failures (inability to find item/confusing request).
