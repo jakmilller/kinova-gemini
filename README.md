@@ -11,7 +11,7 @@ The system consists of three main components:
 2.  **gemini_robotics (Python)**: The "Brain" of the operation. Connects to the Gemini API, handles function calling, requests vision data, calculates 3D coordinates, and orchestrates the action servers.
 3.  **text_interface (Python)**: A simple CLI node for user input.
 
-For a more detailed breakdown, refer to the [architecture plan](architecture_plan.md).
+For a more detailed breakdown, refer to the [architecture plan](system_architecture.md).
 
 ## Prerequisites
 

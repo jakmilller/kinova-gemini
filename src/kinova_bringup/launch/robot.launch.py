@@ -1,6 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.launch_description_sources import PythonLaunchDescriptionSource, AnyLaunchDescriptionSource
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import (
     Command,
@@ -128,6 +128,23 @@ def generate_launch_description():
         }.items()
     )
 
+    rosbridge_launch = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare('rosbridge_server'),
+                'launch',
+                'rosbridge_websocket_launch.xml'
+            ])
+        ])
+    )
+
+    web_video_server_node = Node(
+        package='web_video_server',
+        executable='web_video_server',
+        name='web_video_server',
+        output='screen'
+    )
+
     controller_node = Node(
         package='kortex_controller',
         executable='controller',
@@ -151,5 +168,7 @@ def generate_launch_description():
         robot_state_publisher,
         realsense_transform,
         realsense_launch,
-        # rviz_node,
+        rosbridge_launch,
+        web_video_server_node,
+        rviz_node,
     ])

@@ -57,6 +57,8 @@ class GeminiBrainNode(Node):
             self.instruction_callback,
             10)
             
+        self.status_pub = self.create_publisher(String, '/brain_status', 10)
+            
         # --- Vision/Robot State Setup ---
         self.bridge = CvBridge()
         self.latest_rgb_image = None
@@ -99,22 +101,6 @@ class GeminiBrainNode(Node):
         self.command_start_time = 0.0
 
         # --- Tools (Function Definitions) ---
-        self.move_to_joints_tool = types.FunctionDeclaration(
-            name="move_to_joints",
-            description="Moves the robot arm to specific joint angles in degrees. Arguments must be between 0-360 degrees.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "joint_angles": types.Schema(
-                        type="ARRAY",
-                        items=types.Schema(type="NUMBER"),
-                        description="A list of 7 joint angles in degrees."
-                    ),
-                },
-                required=["joint_angles"]
-            )
-        )
-        
         self.set_gripper_tool = types.FunctionDeclaration(
             name="set_gripper",
             description="Opens or closes the robot gripper.",
@@ -163,9 +149,9 @@ class GeminiBrainNode(Node):
             )
         )
 
-        self.adjust_pose_tool = types.FunctionDeclaration(
-            name="adjust_pose",
-            description="Call when user requests adjusts to robot pose (e.g., 'move up a bit', 'move left slightly'). Arguments are relative adjustments in meters to current pose.",
+        self.adjust_position_tool = types.FunctionDeclaration(
+            name="adjust_position",
+            description="Call when user requests Cartesian positional adjustments to robot pose (e.g., 'move up a bit', 'move left 10 cm'). Arguments are relative adjustments in meters to current pose.",
             parameters=types.Schema(
             type="OBJECT",
             properties={
@@ -176,7 +162,20 @@ class GeminiBrainNode(Node):
             )
         )
 
-        self.tools = [types.Tool(function_declarations=[self.move_to_joints_tool, self.set_gripper_tool, self.move_to_home_tool, self.move_to_user_tool, self.move_to_object_tool, self.adjust_pose_tool])]
+        self.adjust_joints_tool = types.FunctionDeclaration(
+            name="adjust_joints",
+            description="Call when user requests adjustment to the current joint position (e.g., 'rotate last joint 30 degrees'). Arguments are relative adjustments in degrees to current joint angles.",
+            parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "joint number": types.Schema(type="NUMBER", description="The joint number to adjust (1-7)."),
+                "amount": types.Schema(type="NUMBER", description="adjustment in degrees"),
+            },
+            required=["joint number", "amount"]
+            )
+        )
+
+        self.tools = [types.Tool(function_declarations=[self.set_gripper_tool, self.move_to_home_tool, self.move_to_user_tool, self.move_to_object_tool, self.adjust_position_tool, self.adjust_joints_tool])]
         
         self.get_logger().info('Gemini Brain Node initialized and waiting for instructions...')
 
@@ -206,6 +205,9 @@ class GeminiBrainNode(Node):
         user_text = msg.data
         self.get_logger().info(f'Processing instruction: "{user_text}"')
         
+        # Notify UI that instruction is being processed
+        self.status_pub.publish(String(data=f"Received instruction: {user_text}"))
+        
         start_time = time.time()
         self.command_start_time = start_time # Track total command time
 
@@ -229,6 +231,7 @@ class GeminiBrainNode(Node):
         prompt = f"{self.system_prompt}\n\n{state_str}\n\nUser Instruction: {user_text}"
 
         try:
+            # self.status_pub.publish(String(data="Gemini is thinking..."))
             response = self.client.models.generate_content(
                 model=self.flash_model_id,
                 contents=prompt,
@@ -245,26 +248,33 @@ class GeminiBrainNode(Node):
                     await self.execute_function(part.function_call)
                 elif part.text and part.text.strip():
                     self.get_logger().info(f"Gemini response: {part.text.strip()}")
+                    self.status_pub.publish(String(data=f"Gemini: {part.text.strip()}"))
         
         except Exception as e:
             self.get_logger().error(f"Error during Gemini API call or execution: {str(e)}")
+            self.status_pub.publish(String(data=f"Error: {str(e)}"))
 
     async def execute_function(self, function_call):
         name = function_call.name
         args = function_call.args
         
         self.get_logger().info(f"Gemini requested function: {name} with args: {args}")
+        self.status_pub.publish(String(data=f"Executing: {name}"))
         
+        # For direct movement commands, report latency now (start of move)
+        if name not in ["move_to_object"]:
+            latency = time.time() - self.command_start_time
+            self.status_pub.publish(String(data=f"LATENCY: {latency:.2f}s"))
+
         success = False
-        if name == "move_to_joints":
-            success = await self.controller.move_to_joints(args['joint_angles'])
-        elif name == "set_gripper":
+        if name == "set_gripper":
             success = await self.controller.set_gripper(args['position'])
         elif name == "move_to_home":
             success = await self.controller.move_to_home()
         elif name == "move_to_user":
             success = await self.controller.move_to_user()
-        elif name == "adjust_pose":
+            
+        elif name == "adjust_position":
             if self.latest_robot_state:
                 target_x = self.latest_robot_state.x
                 target_y = self.latest_robot_state.y
@@ -279,7 +289,7 @@ class GeminiBrainNode(Node):
                 elif direction == 'z':
                     target_z += amount
                 else:
-                    self.get_logger().warn(f"Unknown direction '{direction}' for adjust_pose. Moving to current pose.")
+                    self.get_logger().warn(f"Unknown direction '{direction}' for adjust_position. Moving to current pose.")
                 
                 success = await self.controller.move_to_pose(
                     target_x, target_y, target_z, 
@@ -290,14 +300,33 @@ class GeminiBrainNode(Node):
             else:
                 self.get_logger().error("Robot state not available. Cannot adjust pose.")
                 success = False
+
+        elif name == "adjust_joints":
+            if self.latest_robot_state:
+                current_angles = list(self.latest_robot_state.joint_angles)
+                joint_idx = int(args.get('joint number', 0)) - 1
+                amount = float(args.get('amount', 0.0))
+                
+                if 0 <= joint_idx < len(current_angles):
+                    current_angles[joint_idx] += amount
+                    success = await self.controller.move_to_joints(current_angles)
+                else:
+                    self.get_logger().error(f"Invalid joint number: {joint_idx + 1}")
+                    success = False
+            else:
+                self.get_logger().error("Robot state not available. Cannot adjust joints.")
+                success = False
+
         elif name == "move_to_object":
             await self.move_to_object(args['description'])
             success = True # Assume success if no exception, logic inside handles logging
             
         if success:
             self.get_logger().info(f"Successfully executed {name}")
+            self.status_pub.publish(String(data=f"SUCCESS: {name}"))
         else:
             self.get_logger().error(f"Failed to execute {name}")
+            self.status_pub.publish(String(data=f"FAILED: {name}"))
 
     async def move_to_object(self, description):
         self.get_logger().info(f"Locating object: {description}")
@@ -355,10 +384,6 @@ class GeminiBrainNode(Node):
             try:
                 masks = vision_utils.parse_segmentation_masks(json_output, img_height=new_height, img_width=new_width)
                 
-                # Calculate total time
-                total_time = time.time() - self.command_start_time
-                self.get_logger().info(f"Total time from command to visualization: {total_time:.4f} seconds")
-
                 if not masks:
                     self.get_logger().warn(f"No objects found for {description}")
                     return
@@ -402,26 +427,26 @@ class GeminiBrainNode(Node):
                     pixel_y = int(((mask_obj.y0 + mask_obj.y1) / 2) * (orig_h / new_height))
 
                 # --- VISUALIZATION: Pop-up the Original Image with Mask ---
-                if self.latest_rgb_image is not None:
-                    final_img = self.latest_rgb_image.copy()
+                # if self.latest_rgb_image is not None:
+                #     final_img = self.latest_rgb_image.copy()
 
-                    # Create a red overlay
-                    mask_overlay = np.zeros_like(final_img)
-                    mask_overlay[object_mask_bool] = [0, 0, 255] # Red (BGR)
+                #     # Create a red overlay
+                #     mask_overlay = np.zeros_like(final_img)
+                #     mask_overlay[object_mask_bool] = [0, 0, 255] # Red (BGR)
                     
-                    # Weighted sum to make it transparent
-                    cv2.addWeighted(mask_overlay, 0.5, final_img, 1.0, 0, final_img)
+                #     # Weighted sum to make it transparent
+                #     cv2.addWeighted(mask_overlay, 0.5, final_img, 1.0, 0, final_img)
                     
-                    # Draw the centroid as a green circle for reference
-                    cv2.circle(final_img, (pixel_x, pixel_y), 10, (0, 255, 0), -1)
+                #     # Draw the centroid as a green circle for reference
+                #     cv2.circle(final_img, (pixel_x, pixel_y), 10, (0, 255, 0), -1)
 
-                    # BETTER POP-UP: Convert to PIL and use .show() 
-                    # This opens the system's default image viewer and DOES NOT block ROS.
-                    final_pil = PILImage.fromarray(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB))
-                    final_pil.show(title=f"Locate Result: {description}")
+                #     # BETTER POP-UP: Convert to PIL and use .show() 
+                #     # This opens the system's default image viewer and DOES NOT block ROS.
+                #     final_pil = PILImage.fromarray(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB))
+                #     final_pil.show(title=f"Locate Result: {description}")
 
-                    self.get_logger().info(f"Visualized {description} at ({pixel_x}, {pixel_y}) on original resolution.")
-                    self.get_logger().info(f"Median Depth of Segment: {depth_val:.2f} mm")
+                #     self.get_logger().info(f"Visualized {description} at ({pixel_x}, {pixel_y}) on original resolution.")
+                #     self.get_logger().info(f"Median Depth of Segment: {depth_val:.2f} mm")
 
                 # --- Camera Intrinsics & Coordinate Transformation ---
                 if self.latest_camera_info is None:
@@ -468,6 +493,10 @@ class GeminiBrainNode(Node):
                     current_theta_y = self.latest_robot_state.theta_y
                     current_theta_z = self.latest_robot_state.theta_z
                     
+                    # Report Latency to START of move (accounting for Vision processing)
+                    latency = time.time() - self.command_start_time
+                    self.status_pub.publish(String(data=f"LATENCY: {latency:.2f}s"))
+
                     self.get_logger().info(f"Sending move_to_pose command to base_link coordinates.")
                     
                     success = await self.controller.move_to_pose(

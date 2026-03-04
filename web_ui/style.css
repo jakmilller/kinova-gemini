@@ -1,0 +1,48 @@
+/* Custom styles for the Kinova Gemini Control UI */
+
+body {
+    background-color: #f3f4f6;
+}
+
+#log-console {
+    scrollbar-width: thin;
+    scrollbar-color: #374151 #111827;
+}
+
+#log-console::-webkit-scrollbar {
+    width: 6px;
+}
+
+#log-console::-webkit-scrollbar-track {
+    background: #111827;
+}
+
+#log-console::-webkit-scrollbar-thumb {
+    background-color: #374151;
+    border-radius: 3px;
+}
+
+/* Smooth transitions for button clicks */
+button {
+    transition: all 0.1s ease-in-out;
+}
+
+button:active {
+    transform: translateY(1px);
+}
+
+#completion-time {
+    min-width: 40px;
+    display: inline-block;
+    text-align: right;
+}
+
+/* Animations for new logs */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+#log-console > div {
+    animation: fadeIn 0.2s ease-out forwards;
+}

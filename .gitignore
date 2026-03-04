@@ -4,3 +4,5 @@ install/
 log/
 pics/
 src/kortex_controller/kortex_api
+__pycache__/
+*.pyc
