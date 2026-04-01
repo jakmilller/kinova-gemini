@@ -230,6 +230,9 @@ void Controller::execute_gripper(const std::shared_ptr<GoalHandleGripper> goal_h
     try {
         mBase->SendGripperCommand(command);
         
+        auto start_time = std::chrono::steady_clock::now();
+        const auto timeout_duration = std::chrono::seconds(3);
+
         while (rclcpp::ok()) {
             if (goal_handle->is_canceling()) {
                 result->success = false;
@@ -246,8 +249,17 @@ void Controller::execute_gripper(const std::shared_ptr<GoalHandleGripper> goal_h
 
             // Compare the feedback (0-100) against your original goal (0-100)
             // A threshold of 1.0 represents a 1% margin of error.
-            if (std::abs(current_pos - goal->position) < 1.0f) break;
+            if (std::abs(current_pos - goal->position) < 1.0f) {
+                break;
+            }
             
+            // Check for timeout
+            auto elapsed_time = std::chrono::steady_clock::now() - start_time;
+            if (elapsed_time > timeout_duration) {
+                RCLCPP_WARN(this->get_logger(), "Gripper action timed out after 3 seconds, assuming object grasped.");
+                break;
+            }
+
             std::this_thread::sleep_for(100ms);
         }
 

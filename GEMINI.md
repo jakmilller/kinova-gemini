@@ -6,8 +6,7 @@ This project integrates a **7 DOF Kinova Gen3 robot** (using the Kortex API) wit
 - **Low-Level Control**: Fully functional ROS2 action servers in C++ for Joint, Pose, and Gripper control.
 - **Text-to-Command**: Functional natural language interface. Gemini decodes user intent into ROS2 action calls using Function Calling (Tools).
 - **Vision**: Pixel-to-3D coordinate transformation and Gemini Vision integration into the "Brain" node are complete. Vision is necessary to complete any `move_to_pose` task (e.g. "move to the blue object" requires the Gemini model to find the object, output the desired coordinates, map the coordinates to the dimensions of the RS camera frame, get the depth at that point, and construct the desired pose command to send to the robot, taking into account the current robot pose). This required knowledge of the robot's state through ROS2 transforms for the Kinova 7DOF Gen3 (must know the current robot pose to move to the new pose), which is now set up.
-- **Voice (WIP)**: Voice input is not yet implemented; currently uses a CLI-based text interface.
-
+- **Voice**: Functional voice command interface using the space bar as a push-to-talk trigger.
 
 ## Project Overview
 
@@ -15,6 +14,7 @@ This project integrates a **7 DOF Kinova Gen3 robot** (using the Kortex API) wit
 - **gemini_robotics (Python)**: The primary ROS2 intelligence package.
     - `gemini_brain_node.py`: The "Reasoning" center. Connects to Google Gemini, handles tool calling, and commands the robot controller.
     - `text_interface_node.py`: A CLI-based node for entering commands (published to `/user_instructions`).
+    - `voice_interface_node.py`: A node for capturing verbal commands via push-to-talk (published to `/user_instructions`).
     - `robot_controller_ros2.py`: The Python action client that bridges the Brain node to the C++ Controller.
 - **ros2_interfaces**: Custom ROS2 action and message definitions (`MoveToPose`, `MoveToJoints`, `GripperCommand`).
 - **config.yaml**: Robot settings (e.g., home joint positions).
@@ -34,7 +34,7 @@ sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' instal
 ```
 
 ### Running the System
-You need three terminals (each sourced with `source install/setup.bash`):
+You need four terminals (each sourced with `source install/setup.bash`):
 
 1. **Terminal 1: Kortex Controller**
    ```bash
@@ -44,17 +44,24 @@ You need three terminals (each sourced with `source install/setup.bash`):
    ```bash
    ros2 run gemini_robotics gemini_brain
    ```
-3. **Terminal 3: Text Interface (User CLI)**
-   ```bash
-   ros2 run gemini_robotics text_interface
-   ```
-4. **RealSense Camera**
+3. **Terminal 3: Text or Voice Interface (User Input)**
+   - For Text:
+     ```bash
+     ros2 run gemini_robotics text_interface
+     ```
+   - For Voice (Push-to-Talk with Spacebar):
+     ```bash
+     ros2 run gemini_robotics voice_interface
+     ```
+4. **Terminal 4: RealSense Camera**
    ```bash
    ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
    ```
-   While not necessary for `move_to_joint` or `set_gripper` commands, running this command exposes these ROS2 topics from the RealSense camera:
-   ```bash
-   /camera/camera/aligned_depth_to_color/camera_info
+
+## Architecture
+
+1.  **Input (text_interface / voice_interface)**: Captures user text or speech and publishes it to the `/user_instructions` topic.
+
    /camera/camera/aligned_depth_to_color/image_raw
    /camera/camera/color/camera_info
    /camera/camera/color/image_raw

@@ -49,11 +49,92 @@ const instructionsTopic = new ROSLIB.Topic({
     messageType : 'std_msgs/msg/String'
 });
 
+const voiceTriggerTopic = new ROSLIB.Topic({
+    ros : ros,
+    name : '/voice_trigger',
+    messageType : 'std_msgs/msg/Bool'
+});
+
 // Subscribers
 const brainStatusListener = new ROSLIB.Topic({
     ros : ros,
     name : '/brain_status',
     messageType : 'std_msgs/msg/String'
+});
+
+const voiceStatusListener = new ROSLIB.Topic({
+    ros : ros,
+    name : '/voice_status',
+    messageType : 'std_msgs/msg/String'
+});
+
+const voiceStatusIndicator = document.getElementById('voice-status-indicator');
+const voiceStatusText = document.getElementById('voice-status-text');
+const voiceBtn = document.getElementById('voice-btn');
+let isRecording = false;
+
+voiceStatusListener.subscribe(function(message) {
+    const status = message.data;
+    if (status === 'IDLE') {
+        voiceStatusIndicator.classList.add('hidden');
+        voiceBtn.classList.remove('text-red-600', 'animate-pulse');
+        voiceBtn.classList.add('text-gray-400');
+        isRecording = false;
+    } else {
+        voiceStatusIndicator.classList.remove('hidden');
+        voiceStatusText.textContent = `Voice: ${status}`;
+        
+        if (status === 'LISTENING') {
+            voiceBtn.classList.add('text-red-600', 'animate-pulse');
+            voiceBtn.classList.remove('text-gray-400');
+            isRecording = true;
+        } else if (status === 'PROCESSING') {
+            voiceBtn.classList.remove('text-red-600', 'animate-pulse');
+            voiceBtn.classList.add('text-blue-600');
+        }
+    }
+});
+
+voiceBtn.addEventListener('click', function() {
+    isRecording = !isRecording;
+    const msg = new ROSLIB.Message({
+        data: isRecording
+    });
+    voiceTriggerTopic.publish(msg);
+    
+    if (isRecording) {
+        addLog('System', 'Voice command triggered...');
+    }
+});
+
+// Spacebar Press-and-Hold Logic
+let spacebarPressed = false;
+
+window.addEventListener('keydown', function(e) {
+    // Only trigger if spacebar is pressed AND we are not already recording
+    // AND the user is not currently typing in the command input field
+    if (e.code === 'Space' && !spacebarPressed && document.activeElement !== commandInput) {
+        e.preventDefault(); // Prevent scrolling down the page
+        spacebarPressed = true;
+        
+        const msg = new ROSLIB.Message({
+            data: true
+        });
+        voiceTriggerTopic.publish(msg);
+        addLog('System', 'Voice recording started (Spacebar held)...');
+    }
+});
+
+window.addEventListener('keyup', function(e) {
+    if (e.code === 'Space' && spacebarPressed) {
+        spacebarPressed = false;
+        
+        const msg = new ROSLIB.Message({
+            data: false
+        });
+        voiceTriggerTopic.publish(msg);
+        addLog('System', 'Voice recording stopped (Spacebar released).');
+    }
 });
 
 brainStatusListener.subscribe(function(message) {

@@ -9,7 +9,10 @@ Users can type natural language instructions, and the Gemini model will decode t
 The system consists of three main components:
 1.  **kortex_controller (C++)**: The core ROS 2 node executing low-level actions via the Kinova hardware API.
 2.  **gemini_robotics (Python)**: The "Brain" of the operation. Connects to the Gemini API, handles function calling, requests vision data, calculates 3D coordinates, and orchestrates the action servers.
-3.  **web_UI**: A local web interface for commands.
+3.  **Input Interfaces**:
+    *   **Web UI**: A local web interface for text commands.
+    *   **Voice Interface**: A push-to-talk interface for verbal commands (Spacebar).
+    *   **Text CLI**: A terminal-based interface for text commands.
 
 For a more detailed breakdown, refer to the [architecture plan](system_architecture.md).
 
@@ -72,14 +75,14 @@ sed -i '1s|.*|#!/path/to/your/anaconda3/envs/kinova-gemini/bin/python3|' install
 
 ## Running the System
 
-You will need two separate terminals. In each terminal, be sure to source your ROS 2 installation and your workspace overlay, and activate the conda environment:
+You will need multiple separate terminals. In each terminal, be sure to source your ROS 2 installation and your workspace overlay, and activate the conda environment:
 ```bash
 source /opt/ros/<distro>/setup.bash
 source install/setup.bash
 conda activate kinova-gemini
 ```
 
-**Terminal 1: Launch Everything**
+**Terminal 1: Launch Core Components**
 Launch the custom controller, robot state publisher, RealSense camera, and UI dependencies.
 ```bash
 ros2 launch kinova_bringup robot.launch.py
@@ -91,11 +94,15 @@ Launch the central reasoning node.
 ros2 run gemini_robotics gemini_brain
 ```
 
-**Open Web Interface**
-Open the interactive web UI in a browser to send commands.
+**Terminal 3 (optional): Voice Interface**
+Launch the voice command node.
 ```bash
-/path/to/ws/kinova-gemini/web_ui/index.html
+ros2 run gemini_robotics voice_interface
 ```
+
+**Web Interface:**
+Open `/path/to/ws/kinova-gemini/web_ui/index.html` in your browser.
+*Hold the **Spacebar** to record a voice command, or use the text interface.*
 
 ## Usage Examples
 In the Web Interface, you can try commands like:
