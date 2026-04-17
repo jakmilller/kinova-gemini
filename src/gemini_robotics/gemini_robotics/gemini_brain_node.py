@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, CameraInfo
 from tf2_ros import Buffer, TransformListener
@@ -10,17 +11,21 @@ from google.genai import types
 import os
 import yaml
 import time
+import subprocess
 from dotenv import load_dotenv
 import asyncio
 import textwrap
 import json
 import cv2
 import numpy as np
-from PIL import Image as PILImage
+import base64
+from io import BytesIO
+from PIL import Image as PILImage, ImageDraw, ImageFont, ImageColor
 
 # We can import the existing controller client
 from .robot_controller_ros2 import KinovaRobotControllerROS2
 from . import vision_utils
+from . import gemini_tools
 from ros2_interfaces.msg import RobotState
 
 class GeminiBrainNode(Node):
@@ -58,8 +63,11 @@ class GeminiBrainNode(Node):
             10)
             
         self.status_pub = self.create_publisher(String, '/brain_status', 10)
+        self.chat_pub = self.create_publisher(String, '/gemini_chat', 10)
+        self.semantic_pub = self.create_publisher(String, '/semantic_position', 10)
             
         # --- Vision/Robot State Setup ---
+        self.state_cb_group = MutuallyExclusiveCallbackGroup()
         self.bridge = CvBridge()
         self.latest_rgb_image = None
         self.latest_depth_image = None
@@ -73,21 +81,24 @@ class GeminiBrainNode(Node):
         # Subscribers for RealSense
         self.create_subscription(
             Image,
-            '/camera/camera/color/image_raw',
+            '/camera/realsense/color/image_raw',
             self.rgb_callback,
-            10
+            10,
+            callback_group=self.state_cb_group
         )
         self.create_subscription(
             Image,
-            '/camera/camera/aligned_depth_to_color/image_raw',
+            '/camera/realsense/aligned_depth_to_color/image_raw',
             self.depth_callback,
-            10
+            10,
+            callback_group=self.state_cb_group
         )
         self.create_subscription(
             CameraInfo,
-            '/camera/camera/aligned_depth_to_color/camera_info',
+            '/camera/realsense/aligned_depth_to_color/camera_info',
             self.camera_info_callback,
-            10
+            10,
+            callback_group=self.state_cb_group
         )
 
         # --- Robot State ---
@@ -95,87 +106,23 @@ class GeminiBrainNode(Node):
             RobotState,
             '/robot_state',
             self.robot_state_callback,
-            10
+            10,
+            callback_group=self.state_cb_group
         )
 
         self.command_start_time = 0.0
 
         # --- Tools (Function Definitions) ---
-        self.set_gripper_tool = types.FunctionDeclaration(
-            name="set_gripper",
-            description="Opens or closes the robot gripper.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "position": types.Schema(
-                        type="NUMBER",
-                        description="The gripper position from 0 (fully open) to 100 (fully closed). The gripper closes roughly 1 cm with every 10 units."
-                    ),
-                },
-                required=["position"]
+        self.tools = [types.Tool(function_declarations=gemini_tools.ALL_TOOLS)]
+
+        self.chat_session = self.client.chats.create(
+            model=self.robot_model_id,
+            config=types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                tools=self.tools,
+                temperature=0.0,
             )
         )
-
-        self.move_to_home_tool = types.FunctionDeclaration(
-            name="move_to_home",
-            description="Moves the robot arm to pre-defined home position. Call anytime the user mentions resetting or going back to the home position.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-            )
-        )
-
-        self.move_to_user_tool = types.FunctionDeclaration(
-            name="move_to_user",
-            description="Moves the robot arm to a pre-defined position near the user. Call anytime the user mentions moving to them or bringing something to them.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-            )
-        )
-
-        self.move_to_object_tool = types.FunctionDeclaration(
-            name="move_to_object",
-            description="Locates an object in the robot's view and navigates to it.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "description": types.Schema(
-                        type="STRING",
-                        description="The name or description of the object to move to (e.g., 'red block', 'plate')."
-                    ),
-                },
-                required=["description"]
-            )
-        )
-
-        self.adjust_position_tool = types.FunctionDeclaration(
-            name="adjust_position",
-            description="Call when user requests Cartesian positional adjustments to robot pose (e.g., 'move up a bit', 'move left 10 cm'). Arguments are relative adjustments in meters to current pose.",
-            parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "direction": types.Schema(type="STRING", description="Axis to adjust: 'x', 'y', or 'z'. 'x' is forward/backward, 'y' is left/right, 'z' is up/down."),
-                "amount": types.Schema(type="NUMBER", description="adjustment in meters"),
-            },
-            required=["direction", "amount"]
-            )
-        )
-
-        self.adjust_joints_tool = types.FunctionDeclaration(
-            name="adjust_joints",
-            description="Call when user requests adjustment to the current joint position (e.g., 'rotate last joint 30 degrees'). Arguments are relative adjustments in degrees to current joint angles.",
-            parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "joint number": types.Schema(type="NUMBER", description="The joint number to adjust (1-7)."),
-                "amount": types.Schema(type="NUMBER", description="adjustment in degrees"),
-            },
-            required=["joint number", "amount"]
-            )
-        )
-
-        self.tools = [types.Tool(function_declarations=[self.set_gripper_tool, self.move_to_home_tool, self.move_to_user_tool, self.move_to_object_tool, self.adjust_position_tool, self.adjust_joints_tool])]
         
         self.get_logger().info('Gemini Brain Node initialized and waiting for instructions...')
 
@@ -189,6 +136,28 @@ class GeminiBrainNode(Node):
 
     def robot_state_callback(self, msg):
         self.latest_robot_state = msg
+        # Publish semantic position to UI
+        semantic_pos = self.get_semantic_position()
+        self.semantic_pub.publish(String(data=semantic_pos))
+
+    def get_semantic_position(self):
+        """Maps current joint angles to a semantic name from config.yaml."""
+        if not self.latest_robot_state:
+            return "Unknown"
+        
+        current_joints = list(self.latest_robot_state.joint_angles)
+        threshold = 5.0 # degrees tolerance
+        
+        for name, pos in self.robot_config.get('joint positions', {}).items():
+            if len(pos) == len(current_joints):
+                # Calculate absolute difference for each joint
+                diffs = [abs(a - b) for a, b in zip(current_joints, pos)]
+                # Handle 360-degree wrapping for joints
+                wrapped_diffs = [min(d, 360.0 - d) for d in diffs]
+                
+                if all(d < threshold for d in wrapped_diffs):
+                    return name
+        return "N/A"
 
     def depth_callback(self, msg):
         try:
@@ -201,148 +170,257 @@ class GeminiBrainNode(Node):
     def camera_info_callback(self, msg):
         self.latest_camera_info = msg
 
+    def publish_chat_message(self, role, text, image=None):
+        """Publishes a structured chat message to the UI."""
+        msg_data = {
+            "role": role,
+            "text": text,
+            "timestamp": time.time()
+        }
+        if image is not None:
+            # Convert PIL image to base64 using optimized JPEG to prevent rosbridge WebSocket from dropping large messages
+            buffered = BytesIO()
+            image = image.convert('RGB') # Ensure format is RGB for JPEG
+            image.save(buffered, format="JPEG", quality=60, optimize=True)
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            msg_data["image"] = f"data:image/jpeg;base64,{img_str}"
+        
+        self.chat_pub.publish(String(data=json.dumps(msg_data)))
+
     async def instruction_callback(self, msg):
         user_text = msg.data
-        self.get_logger().info(f'Processing instruction: "{user_text}"')
+        self.get_logger().info(f'--- New User Goal: "{user_text}" ---')
         
         # Notify UI that instruction is being processed
-        self.status_pub.publish(String(data=f"Received instruction: {user_text}"))
+        self.publish_chat_message("user", user_text)
         
         start_time = time.time()
         self.command_start_time = start_time # Track total command time
 
-        # Build Robot State String
-        if self.latest_robot_state:
-            s = self.latest_robot_state
-            # Format joint angles to be more readable (e.g., list of floats)
-            formatted_joints = [round(x, 3) for x in s.joint_angles]
+        loop_count = 0
+        max_loops = 20
+        current_message = f"User Goal: {user_text}"
+        current_image = None
+
+        while loop_count < max_loops:
+            loop_count += 1
             
-            state_str = textwrap.dedent(f"""
-                Current Robot State:
-                - Joint Angles (degrees): {formatted_joints}
-                - Tool Pose (x, y, z): ({s.x:.3f}, {s.y:.3f}, {s.z:.3f})
-                - Tool Orientation (theta_x, theta_y, theta_z): ({s.theta_x:.3f}, {s.theta_y:.3f}, {s.theta_z:.3f})
-                - Gripper Position (0-100): {s.gripper_position:.1f}
-                """)
-        else:
-            state_str = "Current Robot State: Unknown (Waiting for /robot_state topic...)"
+            # Simple wait to ensure background subscriber has updated state
+            time.sleep(0.1)
 
-        # Combine System Prompt + State + User Instruction
-        prompt = f"{self.system_prompt}\n\n{state_str}\n\nUser Instruction: {user_text}"
+            if self.latest_robot_state:
+                s = self.latest_robot_state
+                formatted_joints = [round(x, 3) for x in s.joint_angles]
+                semantic_pos = self.get_semantic_position()
+                
+                state_str = textwrap.dedent(f"""
+                    Current Robot State:
+                    - Semantic Position: {semantic_pos}
+                    - Joint Angles (degrees): {formatted_joints}
+                    - Tool Pose (x, y, z): ({s.x:.3f}, {s.y:.3f}, {s.z:.3f})
+                    - Tool Orientation (theta_x, theta_y, theta_z): ({s.theta_x:.3f}, {s.theta_y:.3f}, {s.theta_z:.3f})
+                    - Gripper Position (0-100): {s.gripper_position:.1f}
+                    """)
+            else:
+                state_str = "Current Robot State: Unknown (Waiting for /robot_state topic...)"
 
-        try:
-            # self.status_pub.publish(String(data="Gemini is thinking..."))
-            response = self.client.models.generate_content(
-                model=self.flash_model_id,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=self.tools,
-                )
-            )
+            prompt = [f"{state_str}\n\n{current_message}"]
 
-            processing_time = time.time() - start_time
-            self.get_logger().info(f"Gemini processing time: {processing_time:.4f} seconds")
+            # 1. Capture and append the latest realsense RGB image
+            if self.latest_rgb_image is not None:
+                cv_image_rgb = cv2.cvtColor(self.latest_rgb_image, cv2.COLOR_BGR2RGB)
+                pil_img = PILImage.fromarray(cv_image_rgb)
+                width, height = pil_img.size
+                new_width = 800
+                new_height = int(new_width * height / width)
+                img_resized = pil_img.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+                prompt.append("RealSense Camera View:")
+                prompt.append(img_resized)
 
-            for part in response.candidates[0].content.parts:
-                if part.function_call:
-                    await self.execute_function(part.function_call)
-                elif part.text and part.text.strip():
-                    self.get_logger().info(f"Gemini response: {part.text.strip()}")
-                    self.status_pub.publish(String(data=f"Gemini: {part.text.strip()}"))
-        
-        except Exception as e:
-            self.get_logger().error(f"Error during Gemini API call or execution: {str(e)}")
-            self.status_pub.publish(String(data=f"Error: {str(e)}"))
+            # 2. Capture and append RViz snapshot for spatial context
+            try:
+                # Find ONLY visible RViz window IDs
+                window_search = subprocess.check_output(['xdotool', 'search', '--onlyvisible', '--name', 'RViz']).decode().split()
+                if window_search:
+                    # Use the last visible window found (often the main one)
+                    window_id = window_search[-1]
+                    snapshot_path = '/tmp/rviz_snapshot.png'
+                    
+                    # Ensure the file is clean
+                    if os.path.exists(snapshot_path):
+                        os.remove(snapshot_path)
+                    
+                    # Take snapshot using maim (best for OpenGL/RViz)
+                    # -i specifies the window ID
+                    subprocess.run(['maim', '-i', window_id, snapshot_path], check=True)
+                    
+                    if os.path.exists(snapshot_path):
+                        rviz_img = PILImage.open(snapshot_path)
+                        # Resize for token efficiency
+                        rw, rh = rviz_img.size
+                        nrw = 800
+                        nrh = int(nrw * rh / rw)
+                        rviz_resized = rviz_img.resize((nrw, nrh), PILImage.Resampling.LANCZOS)
+                        prompt.append("RViz Visualization (Spatial Context):")
+                        prompt.append(rviz_resized)
+            except Exception as e:
+                self.get_logger().warn(f"Could not capture RViz snapshot: {e}")
+
+            if current_image:
+                prompt.append(current_image)
+                current_image = None # Consume the image for this turn
+
+            try:
+                response = self.chat_session.send_message(prompt)
+
+                task_is_complete = False
+                action_taken = False
+                
+                if not response.candidates or not response.candidates[0].content.parts:
+                    break
+
+                for part in response.candidates[0].content.parts:
+                    if part.text and part.text.strip():
+                        self.publish_chat_message("model", part.text.strip())
+                        if not part.function_call:
+                            current_message = "Please decide the next step or call task_complete."
+
+                    if part.function_call:
+                        if part.function_call.name == "task_complete":
+                            self.get_logger().info("Task marked as complete by Gemini.")
+                            task_is_complete = True
+                            break
+                        
+                        # Execute function and capture result
+                        action_taken = True
+                        action_result, current_image = await self.execute_function(part.function_call)
+                        
+                        # Report result back to UI chat
+                        self.publish_chat_message("system", action_result, image=current_image)
+
+                        current_message = f"Action {part.function_call.name} resulted in: {action_result}. Based on the goal, what is the next action?"
+
+                if task_is_complete:
+                    break
+                    
+                if not action_taken:
+                    # No function call in response
+                    self.get_logger().warn("No action taken by Gemini. Breaking loop.")
+                    break
+            
+            except Exception as e:
+                self.get_logger().error(f"Error during Gemini Chat API call or execution: {str(e)}")
+                self.publish_chat_message("system", f"Error: {str(e)}")
+                break
+
+        if loop_count >= max_loops:
+            self.get_logger().warn("Reached maximum loop iterations for single task.")
+
+        processing_time = time.time() - start_time
+        self.get_logger().info(f"Total task time: {processing_time:.4f} seconds\n")
 
     async def execute_function(self, function_call):
         name = function_call.name
         args = function_call.args
         
-        self.get_logger().info(f"Gemini requested function: {name} with args: {args}")
-        self.status_pub.publish(String(data=f"Executing: {name}"))
+        self.get_logger().info(f"Executing: {name}({args})")
         
         # For direct movement commands, report latency now (start of move)
-        if name not in ["move_to_object"]:
+        if name not in ["move_to_object", "take_picture"]:
             latency = time.time() - self.command_start_time
             self.status_pub.publish(String(data=f"LATENCY: {latency:.2f}s"))
 
         success = False
-        if name == "set_gripper":
-            success = await self.controller.set_gripper(args['position'])
-        elif name == "move_to_home":
-            success = await self.controller.move_to_home()
-        elif name == "move_to_user":
-            success = await self.controller.move_to_user()
-            
-        elif name == "adjust_position":
-            if self.latest_robot_state:
-                target_x = self.latest_robot_state.x
-                target_y = self.latest_robot_state.y
-                target_z = self.latest_robot_state.z
-                direction = args.get('direction', '').lower()
-                amount = float(args.get('amount', 0.0))
+        error_msg = ""
+        success_msg = "Success"
+        captured_img = None
+        
+        try:
+            if name == "grasp_object":
+                success = await self.controller.grasp_object()
+                if success: success_msg = "Success. Gripper closed and object grasped."
+                else: error_msg = "Failed to grasp object"
+            elif name == "open_gripper":
+                success = await self.controller.set_gripper(0.0)
+                if success: success_msg = "Success. Gripper fully opened."
+                else: error_msg = "Failed to open gripper"
+            elif name == "move_to_home":
+                success = await self.controller.move_to_home()
+                if success: success_msg = "Success. Robot returned to the home observation pose."
+                else: error_msg = "Failed to move to home position"
+            elif name == "move_to_user":
+                success = await self.controller.move_to_user()
+                if success: success_msg = "Success. Robot moved to the user interaction pose."
+                else: error_msg = "Failed to move to user position"
                 
-                if direction == 'x':
-                    target_x += amount
-                elif direction == 'y':
-                    target_y += amount
-                elif direction == 'z':
-                    target_z += amount
+            elif name == "move_to_position":
+                time.sleep(0.1) # Ensure fresh state
+                if self.latest_robot_state:
+                    target_x = float(args.get('x', self.latest_robot_state.x))
+                    target_y = float(args.get('y', self.latest_robot_state.y))
+                    target_z = float(args.get('z', self.latest_robot_state.z))
+                    
+                    success = await self.controller.move_to_pose(
+                        target_x, target_y, target_z, 
+                        self.latest_robot_state.theta_x, 
+                        self.latest_robot_state.theta_y, 
+                        self.latest_robot_state.theta_z
+                    )
+                    if success: success_msg = f"Success. Moved to ({target_x:.3f}, {target_y:.3f}, {target_z:.3f})."
+                    else: error_msg = "Failed to reach target pose"
                 else:
-                    self.get_logger().warn(f"Unknown direction '{direction}' for adjust_position. Moving to current pose.")
-                
-                success = await self.controller.move_to_pose(
-                    target_x, target_y, target_z, 
-                    self.latest_robot_state.theta_x, 
-                    self.latest_robot_state.theta_y, 
-                    self.latest_robot_state.theta_z
-                )
-            else:
-                self.get_logger().error("Robot state not available. Cannot adjust pose.")
-                success = False
-
-        elif name == "adjust_joints":
-            if self.latest_robot_state:
-                current_angles = list(self.latest_robot_state.joint_angles)
-                joint_idx = int(args.get('joint number', 0)) - 1
-                amount = float(args.get('amount', 0.0))
-                
-                if 0 <= joint_idx < len(current_angles):
-                    current_angles[joint_idx] += amount
-                    success = await self.controller.move_to_joints(current_angles)
-                else:
-                    self.get_logger().error(f"Invalid joint number: {joint_idx + 1}")
+                    error_msg = "Robot state not available"
                     success = False
-            else:
-                self.get_logger().error("Robot state not available. Cannot adjust joints.")
-                success = False
 
-        elif name == "move_to_object":
-            await self.move_to_object(args['description'])
-            success = True # Assume success if no exception, logic inside handles logging
+            elif name == "adjust_joints":
+                time.sleep(0.1) # Ensure fresh state
+                if self.latest_robot_state:
+                    current_angles = list(self.latest_robot_state.joint_angles)
+                    joint_idx = int(args.get('joint number', 0)) - 1
+                    amount = float(args.get('amount', 0.0))
+                    
+                    if 0 <= joint_idx < len(current_angles):
+                        current_angles[joint_idx] += amount
+                        success = await self.controller.move_to_joints(current_angles)
+                        if success: success_msg = f"Success. Joint {joint_idx + 1} adjusted by {amount} degrees."
+                        else: error_msg = "Failed to move to target joint angles"
+                    else:
+                        error_msg = f"Invalid joint number: {joint_idx + 1}"
+                        success = False
+                else:
+                    error_msg = "Robot state not available"
+                    success = False
+
+            elif name == "inspect_scene":
+                success, error_msg, captured_img = await self.inspect_scene()
+                if success: success_msg = f"Success.\n{error_msg}" # For inspect_scene, error_msg holds the report when successful
+                
+        except Exception as e:
+            success = False
+            error_msg = f"Exception occurred: {str(e)}"
+            
+        img_to_return = captured_img if (name in ["inspect_scene"] and success) else None
             
         if success:
-            self.get_logger().info(f"Successfully executed {name}")
-            self.status_pub.publish(String(data=f"SUCCESS: {name}"))
+            return success_msg, img_to_return
         else:
-            self.get_logger().error(f"Failed to execute {name}")
-            self.status_pub.publish(String(data=f"FAILED: {name}"))
+            full_error = f"Failed: {error_msg}" if error_msg else "Failed to execute action"
+            self.get_logger().error(f"{name} {full_error}")
+            return full_error, None
 
-    async def move_to_object(self, description):
-        self.get_logger().info(f"Locating object: {description}")
+    async def inspect_scene(self):
+        """Identifies all objects in the scene and returns their 3D poses using high-precision masks."""
+        self.get_logger().info("Performing high-precision scene inspection...")
 
-        # note to self: handle case where the model cant find the requested object
-        
         # 1. Capture Image (Wait for fresh data)
         for _ in range(10):
             if self.latest_rgb_image is not None and self.latest_depth_image is not None:
                 break
             self.get_logger().info("Waiting for images from RealSense...")
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
             
         if self.latest_rgb_image is None:
-             self.get_logger().error("No RGB image received from RealSense.")
-             return
+             return False, "No RGB image received from RealSense.", None
 
         # Convert OpenCV BGR to PIL RGB
         cv_image_rgb = cv2.cvtColor(self.latest_rgb_image, cv2.COLOR_BGR2RGB)
@@ -356,170 +434,107 @@ class GeminiBrainNode(Node):
 
         # Store the depth map (associated with this capture)
         captured_depth = self.latest_depth_image.copy()
+        orig_h, orig_w = captured_depth.shape
 
-        # 2. Query Gemini (Requesting Segmentation Masks)
-        prompt = textwrap.dedent(f"""\
-            Return segmentation masks for: {description}.
-            The answer should follow the JSON format:
-            [{{"box_2d": [ymin, xmin, ymax, xmax], "mask": "png_base64_str", "label": "{description}"}}]
-            
+        # 2. Query Gemini for Masks
+        prompt = textwrap.dedent("""\
+            Identify all prominent items in the scene. 
+            For each item, provide a bounding box, a descriptive label, and a segmentation mask.
+            Return the result as a JSON list:
+            [{"box_2d": [ymin, xmin, ymax, xmax], "label": "item name", "mask": "png_base64_str"}]
             The coordinates are normalized to 0-1000.
             """)
         
         try:
-            # We use the same client/model to query for vision
             response = self.client.models.generate_content(
                 model=self.robot_model_id,
                 contents=[img_resized, prompt],
-                config=types.GenerateContentConfig(
-                    temperature=0.5,
-                )
+                config=types.GenerateContentConfig(temperature=0.0)
             )
             
-            # 3. Parse and Visualize
             json_output = response.text
-            self.get_logger().info(f"Gemini Vision Response: {json_output}")
+            self.get_logger().info(f"Vision response received. Processing masks...")
             
-            # Visualize Segmentation Masks (Pop up window)
-            try:
-                masks = vision_utils.parse_segmentation_masks(json_output, img_height=new_height, img_width=new_width)
-                
-                if not masks:
-                    self.get_logger().warn(f"No objects found for {description}")
-                    return
+            # Use the segmentation parser from vision_utils
+            masks = vision_utils.parse_segmentation_masks(json_output, img_height=new_height, img_width=new_width)
 
-                # 4. Process Mask for Depth and Visualization on ORIGINAL Image
-                mask_obj = masks[0] # Take the first mask
+            if not masks:
+                return True, "No items detected in the scene.", img_resized
+
+            # 3. Process each mask for 3D pose (Median of Mask Math)
+            scene_report = "Scene Inspection Report:\n"
+            annotated_img = img_resized.copy()
+            
+            # Prepare transformation (from camera to base)
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'base_link',
+                    'physical_realsense_link',
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=1.0)
+                )
+            except TransformException as ex:
+                return False, f"Transformation error: {ex}", None
+
+            if self.latest_camera_info is None:
+                return False, "Camera info not available.", None
+
+            for i, mask_obj in enumerate(masks):
+                label = mask_obj.label
                 
-                # Resize the mask to match the original image dimensions
-                orig_h, orig_w = captured_depth.shape
-                # mask_obj.mask is (new_height, new_width)
-                # cv2.resize expects (width, height)
+                # Upscale mask to original resolution for depth mapping
                 upscaled_mask = cv2.resize(mask_obj.mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                
-                # Ensure it's binary (0 or 255)
                 _, binary_mask_orig = cv2.threshold(upscaled_mask, 127, 255, cv2.THRESH_BINARY)
                 
-                # --- Depth Calculation (Median of Mask) ---
-                # Create a boolean mask where the object is
+                # Extract median depth within the mask (robust to noise)
                 object_mask_bool = (binary_mask_orig > 0)
-                
-                # Extract depth values within the mask
                 depth_values = captured_depth[object_mask_bool]
+                valid_depths = depth_values[depth_values > 0]
                 
-                # Filter out invalid depth values (0 often indicates no data in RealSense)
-                valid_depth_values = depth_values[depth_values > 0]
-                
-                if len(valid_depth_values) == 0:
-                    self.get_logger().warn("No valid depth values found in the masked region.")
-                    depth_val = 0
-                else:
-                    depth_val = np.median(valid_depth_values)
-                
-                # Calculate Centroid (for reporting/logic if needed, though depth is now median)
+                if len(valid_depths) == 0:
+                    scene_report += f"- {label}: Pose unknown (no valid depth in mask).\n"
+                    continue
+
+                depth_meters = np.median(valid_depths) / 1000.0
+
+                # Calculate Centroid for 3D projection
                 M = cv2.moments(binary_mask_orig)
                 if M["m00"] != 0:
                     pixel_x = int(M["m10"] / M["m00"])
                     pixel_y = int(M["m01"] / M["m00"])
                 else:
-                    # Fallback to bbox center of the resized mask scaled up
+                    # Fallback to bbox center
                     pixel_x = int(((mask_obj.x0 + mask_obj.x1) / 2) * (orig_w / new_width))
                     pixel_y = int(((mask_obj.y0 + mask_obj.y1) / 2) * (orig_h / new_height))
-
-                # --- VISUALIZATION: Pop-up the Original Image with Mask ---
-                # if self.latest_rgb_image is not None:
-                #     final_img = self.latest_rgb_image.copy()
-
-                #     # Create a red overlay
-                #     mask_overlay = np.zeros_like(final_img)
-                #     mask_overlay[object_mask_bool] = [0, 0, 255] # Red (BGR)
-                    
-                #     # Weighted sum to make it transparent
-                #     cv2.addWeighted(mask_overlay, 0.5, final_img, 1.0, 0, final_img)
-                    
-                #     # Draw the centroid as a green circle for reference
-                #     cv2.circle(final_img, (pixel_x, pixel_y), 10, (0, 255, 0), -1)
-
-                #     # BETTER POP-UP: Convert to PIL and use .show() 
-                #     # This opens the system's default image viewer and DOES NOT block ROS.
-                #     final_pil = PILImage.fromarray(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB))
-                #     final_pil.show(title=f"Locate Result: {description}")
-
-                #     self.get_logger().info(f"Visualized {description} at ({pixel_x}, {pixel_y}) on original resolution.")
-                #     self.get_logger().info(f"Median Depth of Segment: {depth_val:.2f} mm")
-
-                # --- Camera Intrinsics & Coordinate Transformation ---
-                if self.latest_camera_info is None:
-                    self.get_logger().error("Camera info not received yet. Cannot transform to 3D.")
-                    return
-
-                # Convert depth to meters
-                depth_meters = depth_val / 1000.0
-
-                if depth_meters == 0:
-                    self.get_logger().error("Invalid depth for transformation. Aborting move.")
-                    return
 
                 # 1. Pixel to 3D in Camera Frame
                 cam_x, cam_y, cam_z = vision_utils.get_3d_point_from_pixel(
                     pixel_x, pixel_y, depth_meters, self.latest_camera_info
                 )
-                self.get_logger().info(f"Object 3D coordinates in realsense_link: ({cam_x:.3f}, {cam_y:.3f}, {cam_z:.3f})")
+                # 2. Transform to Base Frame
+                base_x, base_y, base_z = vision_utils.transform_point(
+                    cam_x, cam_y, cam_z, transform
+                )
+                
+                scene_report += f"- {label}: Pose(x={base_x:.3f}, y={base_y:.3f}, z={base_z:.3f}) relative to base.\n"
 
-                # 2. Transform Camera Frame to Base Frame using TF2
-                try:
-                    # Look up transform from base_link to realsense_link
-                    # Target frame is base_link, source frame is realsense_link
-                    transform = self.tf_buffer.lookup_transform(
-                        'base_link',
-                        'realsense_link',
-                        rclpy.time.Time(),
-                        timeout=rclpy.duration.Duration(seconds=1.0)
-                    )
-                    
-                    # Apply transform
-                    base_x, base_y, base_z = vision_utils.transform_point(
-                        cam_x, cam_y, cam_z, transform
-                    )
-                    self.get_logger().info(f"Object 3D coordinates in base_link: ({base_x:.3f}, {base_y:.3f}, {base_z:.3f})")
+                # 4. Annotate image for user verification
+                draw = ImageDraw.Draw(annotated_img)
+                colors = ["red", "green", "blue", "yellow", "orange", "pink", "purple", "cyan", "magenta"]
+                color = colors[i % len(colors)]
+                
+                # Draw the box on the resized image
+                box = [mask_obj.y0, mask_obj.x0, mask_obj.y1, mask_obj.x1]
+                draw.rectangle(((box[1], box[0]), (box[3], box[2])), outline=color, width=3)
+                draw.text((box[1] + 5, box[0] + 5), label, fill=color)
 
-                    # 3. Move Robot
-                    if self.latest_robot_state is None:
-                        self.get_logger().error("Robot state not available. Cannot get current orientation.")
-                        return
-
-                    # Get current orientation to maintain it
-                    current_theta_x = self.latest_robot_state.theta_x
-                    current_theta_y = self.latest_robot_state.theta_y
-                    current_theta_z = self.latest_robot_state.theta_z
-                    
-                    # Report Latency to START of move (accounting for Vision processing)
-                    latency = time.time() - self.command_start_time
-                    self.status_pub.publish(String(data=f"LATENCY: {latency:.2f}s"))
-
-                    self.get_logger().info(f"Sending move_to_pose command to base_link coordinates.")
-                    
-                    success = await self.controller.move_to_pose(
-                        base_x, base_y, base_z,
-                        current_theta_x, current_theta_y, current_theta_z
-                    )
-                    
-                    if success:
-                        self.get_logger().info("Successfully moved to object.")
-                    else:
-                        self.get_logger().error("Failed to move to object.")
-
-                except TransformException as ex:
-                    self.get_logger().error(f"Could not transform realsense_link to base_link: {ex}")
-                    return
-
-            except Exception as e:
-                self.get_logger().error(f"Error parsing or plotting masks: {e}")
-                # Fallback to bounding box if parsing fails? 
-                # For now, let's stick to the requested mask workflow.
+            return True, scene_report, annotated_img
 
         except Exception as e:
-            self.get_logger().error(f"Error in vision pipeline: {e}")
+            self.get_logger().error(f"Error in inspect_scene: {str(e)}")
+            return False, f"Inspection failed: {str(e)}", None
+
+
 
 
 

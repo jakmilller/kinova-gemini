@@ -1,6 +1,6 @@
 # configurable settings
 model:
-  flash: "gemini-2.5-flash-lite"
+  flash: "gemini-3-flash-preview"
   robot: "gemini-robotics-er-1.5-preview"
   # other models
         # gemini-robotics-er-1.5-preview

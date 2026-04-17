@@ -4,22 +4,63 @@ body {
     background-color: #f3f4f6;
 }
 
-#log-console {
+#chat-container {
     scrollbar-width: thin;
-    scrollbar-color: #374151 #111827;
+    scrollbar-color: #e5e7eb #f9fafb;
 }
 
-#log-console::-webkit-scrollbar {
+#chat-container::-webkit-scrollbar {
     width: 6px;
 }
 
-#log-console::-webkit-scrollbar-track {
-    background: #111827;
+#chat-container::-webkit-scrollbar-track {
+    background: #f9fafb;
 }
 
-#log-console::-webkit-scrollbar-thumb {
-    background-color: #374151;
+#chat-container::-webkit-scrollbar-thumb {
+    background-color: #e5e7eb;
     border-radius: 3px;
+}
+
+/* Chat bubble styles */
+.message {
+    max-width: 90%;
+    margin-bottom: 0.5rem;
+    padding: 0.75rem;
+    border-radius: 1rem;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    position: relative;
+    animation: fadeIn 0.2s ease-out forwards;
+}
+
+.message-user {
+    align-self: flex-end;
+    background-color: #3b82f6;
+    color: white;
+    border-bottom-right-radius: 0.25rem;
+}
+
+.message-model {
+    align-self: flex-start;
+    background-color: #7c3aed;
+    color: white;
+    border-bottom-left-radius: 0.25rem;
+}
+
+.message-system {
+    align-self: center;
+    background-color: #f3f4f6;
+    color: #4b5563;
+    font-style: italic;
+    font-size: 0.75rem;
+    max-width: 100%;
+}
+
+.message-image {
+    width: 100%;
+    border-radius: 0.5rem;
+    margin-top: 0.5rem;
 }
 
 /* Smooth transitions for button clicks */
@@ -37,12 +78,8 @@ button:active {
     text-align: right;
 }
 
-/* Animations for new logs */
+/* Animations for new messages */
 @keyframes fadeIn {
     from { opacity: 0; transform: translateY(5px); }
     to { opacity: 1; transform: translateY(0); }
-}
-
-#log-console > div {
-    animation: fadeIn 0.2s ease-out forwards;
 }

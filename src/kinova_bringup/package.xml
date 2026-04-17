@@ -16,6 +16,7 @@
 
   <depend>kinova_gen3_7dof_robotiq_2f_85_moveit_config</depend>
   <depend>kortex_driver</depend>
+  <depend>rtabmap_ros</depend>
   
   <export>
     <build_type>ament_cmake</build_type>

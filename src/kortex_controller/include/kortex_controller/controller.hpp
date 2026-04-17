@@ -51,6 +51,7 @@ private:
     rclcpp_action::Server<MoveToPose>::SharedPtr mActionPoseServer;
     rclcpp_action::Server<MoveToJoints>::SharedPtr mActionJointsServer;
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGripperServer;
+    rclcpp_action::Server<GripperCommand>::SharedPtr mActionGraspServer;
 
     // Services
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr mSrvAdmittance;
@@ -83,4 +84,10 @@ private:
     rclcpp_action::CancelResponse handle_gripper_cancel(const std::shared_ptr<GoalHandleGripper>);
     void handle_gripper_accepted(const std::shared_ptr<GoalHandleGripper> goal_handle);
     void execute_gripper(const std::shared_ptr<GoalHandleGripper> goal_handle);
+
+    // Action Handlers (Grasp Object)
+    rclcpp_action::GoalResponse handle_grasp_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const GripperCommand::Goal>);
+    rclcpp_action::CancelResponse handle_grasp_cancel(const std::shared_ptr<GoalHandleGripper>);
+    void handle_grasp_accepted(const std::shared_ptr<GoalHandleGripper> goal_handle);
+    void execute_grasp(const std::shared_ptr<GoalHandleGripper> goal_handle);
 };

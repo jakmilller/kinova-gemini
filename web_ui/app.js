@@ -5,7 +5,7 @@ const ros = new ROSLIB.Ros({
 
 // DOM Elements
 const statusEl = document.getElementById('connection-status');
-const logConsole = document.getElementById('log-console');
+const chatContainer = document.getElementById('chat-container');
 const commandForm = document.getElementById('command-form');
 const commandInput = document.getElementById('command-input');
 const estopBtn = document.getElementById('estop-btn');
@@ -14,6 +14,7 @@ const statePosition = document.getElementById('state-position');
 const stateOrientation = document.getElementById('state-orientation');
 const stateJoints = document.getElementById('state-joints');
 const stateGripper = document.getElementById('state-gripper');
+const stateSemantic = document.getElementById('state-semantic');
 
 const performanceBox = document.getElementById('performance-box');
 const completionTimeEl = document.getElementById('completion-time');
@@ -25,21 +26,21 @@ ros.on('connection', function() {
     statusEl.textContent = 'Connected';
     statusEl.classList.remove('bg-red-100', 'text-red-600');
     statusEl.classList.add('bg-green-100', 'text-green-600');
-    addLog('System', 'Connected to ROS 2 bridge.');
+    addChatMessage('system', 'Connected to ROS 2 bridge.');
 });
 
 ros.on('error', function(error) {
     statusEl.textContent = 'Error';
     statusEl.classList.remove('bg-green-100', 'text-green-600');
     statusEl.classList.add('bg-red-100', 'text-red-600');
-    addLog('Error', 'WebSocket connection error.');
+    addChatMessage('system', 'WebSocket connection error.');
 });
 
 ros.on('close', function() {
     statusEl.textContent = 'Disconnected';
     statusEl.classList.remove('bg-green-100', 'text-green-600');
     statusEl.classList.add('bg-red-100', 'text-red-600');
-    addLog('System', 'Disconnected from ROS 2.');
+    addChatMessage('system', 'Disconnected from ROS 2.');
 });
 
 // Publishers
@@ -60,6 +61,24 @@ const brainStatusListener = new ROSLIB.Topic({
     ros : ros,
     name : '/brain_status',
     messageType : 'std_msgs/msg/String'
+});
+
+const geminiChatListener = new ROSLIB.Topic({
+    ros : ros,
+    name : '/gemini_chat',
+    messageType : 'std_msgs/msg/String'
+});
+
+const semanticPositionListener = new ROSLIB.Topic({
+    ros : ros,
+    name : '/semantic_position',
+    messageType : 'std_msgs/msg/String'
+});
+
+semanticPositionListener.subscribe(function(message) {
+    if (stateSemantic) {
+        stateSemantic.textContent = message.data;
+    }
 });
 
 const voiceStatusListener = new ROSLIB.Topic({
@@ -103,7 +122,7 @@ voiceBtn.addEventListener('click', function() {
     voiceTriggerTopic.publish(msg);
     
     if (isRecording) {
-        addLog('System', 'Voice command triggered...');
+        addChatMessage('system', 'Voice command triggered...');
     }
 });
 
@@ -121,7 +140,7 @@ window.addEventListener('keydown', function(e) {
             data: true
         });
         voiceTriggerTopic.publish(msg);
-        addLog('System', 'Voice recording started (Spacebar held)...');
+        addChatMessage('system', 'Voice recording started (Spacebar held)...');
     }
 });
 
@@ -133,14 +152,14 @@ window.addEventListener('keyup', function(e) {
             data: false
         });
         voiceTriggerTopic.publish(msg);
-        addLog('System', 'Voice recording stopped (Spacebar released).');
+        addChatMessage('system', 'Voice recording stopped (Spacebar released).');
     }
 });
 
 brainStatusListener.subscribe(function(message) {
     const data = message.data;
-    addLog('Brain', data);
-
+    // We can still use brain status for latency or terminal-like logs
+    
     // Check for latency report (time to start of move)
     if (data.includes('LATENCY:')) {
         const timeMatch = data.match(/LATENCY: ([\d.]+)s/);
@@ -148,6 +167,15 @@ brainStatusListener.subscribe(function(message) {
             performanceBox.classList.remove('hidden');
             completionTimeEl.textContent = timeMatch[1] + 's';
         }
+    }
+});
+
+geminiChatListener.subscribe(function(message) {
+    try {
+        const chatData = JSON.parse(message.data);
+        addChatMessage(chatData.role, chatData.text, chatData.image);
+    } catch (e) {
+        console.error("Failed to parse chat message:", e);
     }
 });
 
@@ -187,11 +215,13 @@ commandForm.addEventListener('submit', function(e) {
             data: cmd
         });
         instructionsTopic.publish(msg);
-        addLog('User', cmd);
+        // We'll let the brain node echo this back through /gemini_chat for consistency
+        // but adding it here manually for instant feedback if desired
+        // addChatMessage('user', cmd); 
         commandInput.value = '';
         
         // Reset timer display for new command
-        performanceBox.classList.remove('hidden');
+        performanceBox.classList.add('hidden');
         completionTimeEl.textContent = '...';
     }
 });
@@ -202,27 +232,30 @@ estopBtn.addEventListener('click', function() {
         data: 'Stop immediately!'
     });
     instructionsTopic.publish(msg); // Both brain and controller listen to this for stop
-    addLog('E-STOP', 'Emergency Stop Issued!', true);
+    addChatMessage('system', 'EMERGENCY STOP ISSUED!');
     
     // Visual feedback for e-stop
     estopBtn.classList.add('bg-red-800');
     setTimeout(() => estopBtn.classList.remove('bg-red-800'), 500);
 });
 
-// Helper: Add log to console
-function addLog(sender, message, isError = false) {
-    const logEl = document.createElement('div');
-    const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// Helper: Add message to chat container
+function addChatMessage(role, text, image = null) {
+    const messageEl = document.createElement('div');
+    messageEl.classList.add('message', `message-${role}`);
     
-    let colorClass = 'text-green-400';
-    if (sender === 'User') colorClass = 'text-blue-400';
-    if (sender === 'Brain') colorClass = 'text-purple-400';
-    if (isError || sender === 'E-STOP' || sender === 'Error' || message.includes('FAILED')) colorClass = 'text-red-500 font-bold';
-    if (message.includes('SUCCESS')) colorClass = 'text-green-300 font-bold';
-
-    logEl.innerHTML = `<span class="text-gray-600 font-normal mr-1">${time}</span><span class="${colorClass} mr-2">[${sender}]</span><span class="text-gray-100">${message}</span>`;
-    logConsole.appendChild(logEl);
+    let contentHtml = `<div class="text-xs font-bold opacity-70 mb-1 uppercase tracking-tighter">${role}</div>`;
+    
+    // Use whitespace-pre-wrap to preserve newlines and indentation in reports
+    contentHtml += `<div class="whitespace-pre-wrap font-mono mt-1 leading-relaxed">${text}</div>`;
+    
+    if (image) {
+        contentHtml += `<img src="${image}" class="message-image mt-2 rounded border border-black/10" alt="Scene Analysis">`;
+    }
+    
+    messageEl.innerHTML = contentHtml;
+    chatContainer.appendChild(messageEl);
     
     // Auto-scroll to bottom
-    logConsole.scrollTop = logConsole.scrollHeight;
+    chatContainer.scrollTop = chatContainer.scrollHeight;
 }

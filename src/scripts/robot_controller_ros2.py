@@ -28,6 +28,7 @@ class KinovaRobotControllerROS2(Node):
         self._action_pose_client = ActionClient(self, MoveToPose, 'move_to_pose')
         self._action_joints_client = ActionClient(self, MoveToJoints, 'move_to_joints')
         self._action_gripper_client = ActionClient(self, GripperCommand, 'gripper_command')
+        self._action_grasp_object = ActionClient(self, GripperCommand, 'grasp_object')
 
         # --- Service Client (for Admittance) ---
         self.admittance_client = self.create_client(SetBool, 'toggle_admittance')
@@ -72,13 +73,20 @@ class KinovaRobotControllerROS2(Node):
         """Moves the robot to a pre-defined position near the user."""
         return await self.move_to_joints(self.user_position)
 
-    async def set_gripper(self, position: float):
+    async def set_gripper(self, position: float): 
         """Sends a GripperCommand action goal (0-100)."""
         goal_msg = GripperCommand.Goal()
         goal_msg.position = float(position)
 
         self.get_logger().info(f'Sending Gripper goal: {position}')
         return await self._send_action_goal(self._action_gripper_client, goal_msg)
+    
+    async def grasp_object(self):
+        """Closes the gripper until it detects contact with an object"""
+        goal_msg = GripperCommand.Goal()
+        goal_msg.position = 99.0  # try to full close, but the action server will stop when it detects contact
+        return await self._send_action_goal(self._action_grasp_object, goal_msg)
+
 
     async def toggle_admittance(self, enable: bool):
         """Calls the toggle_admittance service."""

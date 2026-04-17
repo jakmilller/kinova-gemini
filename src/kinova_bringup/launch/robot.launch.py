@@ -90,23 +90,40 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=[
-            '-0.03',  # x offset (all offsets calculated from mounted RealSense)
-            '-0.003',    # y offset
+            '-0.01',  # x offset (all offsets calculated from mounted RealSense)
+            '0.003',    # y offset
             '0.031',   # z offset
-            '0.0',    # roll
-            '0.0',    # pitch
-            '0.0',    # yaw
+            '-1.5708',    # roll
+            '-1.5708',    # pitch
+            '3.14159',    # yaw
             'camera_link',  # kinova camera frame
             'realsense_link'  # external RealSense frame
         ],
         name='realsense_transform'
     )
 
+# the first one makes sure that the pointclouds are visualized right, this one is for inspect_scene
+    physical_realsense_transform = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=[
+            '-0.02',  # x offset (all offsets calculated from mounted RealSense)
+            '-0.003',    # y offset
+            '0.031',   # z offset
+            '0',    # roll
+            '0',    # pitch
+            '0',    # yaw
+            'camera_link',  # kinova camera frame
+            'physical_realsense_link'  # external RealSense frame
+        ],
+        name='physical_realsense_transform'
+    )
+
     # RViz for visualization
     rviz_config_file = PathJoinSubstitution(
-        [FindPackageShare("kortex_description"), "rviz", "view_robot.rviz"]
+        [FindPackageShare("kinova_bringup"), "config", "robot.rviz"]
     )
-    
+
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
@@ -124,7 +141,9 @@ def generate_launch_description():
             ])
         ]),
         launch_arguments={
-            'align_depth.enable': 'true'
+            'align_depth.enable': 'true',
+            'pointcloud.enable': 'true',
+            'camera_name': 'realsense',
         }.items()
     )
 
@@ -167,6 +186,7 @@ def generate_launch_description():
         controller_node,
         robot_state_publisher,
         realsense_transform,
+        physical_realsense_transform,
         realsense_launch,
         rosbridge_launch,
         web_video_server_node,

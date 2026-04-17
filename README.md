@@ -1,20 +1,29 @@
 # Gemini Integration for Kinova Gen3
 
-This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini models (`gemini-robotics-er-1.5-preview`) for natural language and vision-guided robotics tasks. The robot uses an attached Intel RealSense camera and a Robotiq 2F-140 gripper.
+This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini models for advanced natural language and vision-guided robotics. The system employs a multi-turn reasoning loop, allowing the robot to perform complex, multi-step tasks like "Pick up the toy and put it in the box."
 
-Users can type natural language instructions, and the Gemini model will decode the intent into function calls (ROS 2 actions) for movement, gripper control, and vision-based object location.
+## High-Level Features
+*   **Model Intelligence**: Uses **Gemini 1.5 Robotics ER** for multi-step reasoning and high-precision visual object segmentation.
+*   **Embodied Awareness**: The model receives live RGB images from an arm-mounted RealSense camera and spatial "third-person" context via RViz snapshots.
+*   **Multi-Turn Interaction**: The robot can ask for clarification, perform intermediate inspection steps, and adjust its plan based on visual feedback.
 
 ## Architecture Overview
 
 The system consists of three main components:
-1.  **kortex_controller (C++)**: The core ROS 2 node executing low-level actions via the Kinova hardware API.
-2.  **gemini_robotics (Python)**: The "Brain" of the operation. Connects to the Gemini API, handles function calling, requests vision data, calculates 3D coordinates, and orchestrates the action servers.
+1.  **kortex_controller (C++)**: Low-level execution of robot actions via the Kinova Kortex API.
+2.  **gemini_robotics (Python)**: The central reasoning node. Orchestrates the vision pipeline, manages tool-calling logic, and maintains the conversational state with Gemini.
 3.  **Input Interfaces**:
-    *   **Web UI**: A local web interface for text commands.
-    *   **Voice Interface**: A push-to-talk interface for verbal commands (Spacebar).
-    *   **Text CLI**: A terminal-based interface for text commands.
+    *   **Web UI**: A modern web interface for text commands and live chat feedback (including annotated images).
+    *   **Voice Interface**: Push-to-talk verbal commands (Spacebar).
 
-For a more detailed breakdown, refer to the [architecture plan](system_architecture.md).
+For a deep dive into the software design, see [system_architecture.md](system_architecture.md).
+
+## Usage Examples
+The robot is now capable of multi-step tasks:
+*   *"Put the red toy in the blue bin."*
+*   *"Move the apple between the banana and the orange."*
+*   *"Give me the toy on the left."*
+*   *"Clear the table by moving everything to the box."*
 
 ## Prerequisites
 
@@ -106,12 +115,11 @@ Open `/path/to/ws/kinova-gemini/web_ui/index.html` in your browser.
 
 ## Usage Examples
 In the Web Interface, you can try commands like:
-*   *"Go to the blue toy"*
-*   *"Move up 5cm"*
-*   *"Rotate the last joint 30 degrees"*
-*   *"Open the gripper slightly"*
+*   *"Put the red toy in the blue bin."*
+*   *"Move the apple between the banana and the orange."*
+*   *"Give me the toy on the left."*
+*   *"Clear the table by moving everything to the box."*
+
 
 ## Limitations
-Moving to objects is simplified by keeping the current end-effector orientation before and after the `move_to_pose` call. Future work should use intelligently determine the correct orientation to facilitate acquisition.
-
-This repository currently only supports simple robot movements. It does not currently support longer-horizon tasks (ex: *"Bring me the cup"* requires moving to cup, determining how to pick up, verifying acquisition, and bringing it to the user)
+Manipulation has been simplified by keeping the current end-effector orientation before and after the `move_to_position` call (think arcade claw machine). We are currently working on reasoning about the correct object affordances (i.e. picking up a box by the side), as well as adjusting the orientation of the end-effector intelligently.

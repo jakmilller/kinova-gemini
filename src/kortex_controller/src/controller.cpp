@@ -52,6 +52,12 @@ Controller::Controller() : Node("kinova_controller")
         std::bind(&Controller::handle_gripper_cancel, this, _1),
         std::bind(&Controller::handle_gripper_accepted, this, _1));
 
+    this->mActionGraspServer = rclcpp_action::create_server<ros2_interfaces::action::GripperCommand>(
+        this, "grasp_object",
+        std::bind(&Controller::handle_grasp_goal, this, _1, _2),
+        std::bind(&Controller::handle_grasp_cancel, this, _1),
+        std::bind(&Controller::handle_grasp_accepted, this, _1));
+
     // --- Additional Services ---
     mSrvAdmittance = this->create_service<std_srvs::srv::SetBool>(
         "toggle_admittance", std::bind(&Controller::toggleAdmittance, this, _1, _2));
@@ -59,7 +65,7 @@ Controller::Controller() : Node("kinova_controller")
     // --- Telemetry Pub ---
     mPubState = this->create_publisher<ros2_interfaces::msg::RobotState>("robot_state", 10);
     mPubJointState = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
-    mTimer = this->create_wall_timer(100ms, std::bind(&Controller::publishState, this));
+    mTimer = this->create_wall_timer(10ms, std::bind(&Controller::publishState, this));
     
     RCLCPP_INFO(this->get_logger(), "Kinova Controller Initialized");
 }
@@ -302,8 +308,11 @@ void Controller::publishState()
         msg.joint_angles[i] = feedback.actuators(i).position();
     }
     
-    float gripper_pos_0_100 = feedback.interconnect().gripper_feedback().motor()[0].position();
-    msg.gripper_position = gripper_pos_0_100;
+    auto gripper_feedback = feedback.interconnect().gripper_feedback().motor()[0];
+    msg.gripper_position = gripper_feedback.position();
+    msg.gripper_velocity = gripper_feedback.velocity();
+    msg.gripper_current = gripper_feedback.current_motor()*100;
+    // to make everything easier, i scaled the gripper stuff to a 0-100 range for easier visualization in PlotJuggler
     
     mPubState->publish(msg);
 
@@ -323,11 +332,8 @@ void Controller::publishState()
 
     // Gripper Joint
     // 0-100% -> 0.0-0.8 (approx closed)
-    // Robotiq 2F-140: 0 is Open, 140mm is Closed? No, 0 is Open in Kortex 0-100?
-    // Let's assume 0.8 scaling factor logic from old controller is correct for URDF.
-    // Logic from old controller: position() is 0-100. 
-    // joint_state.position.push_back(0.8 * position / 100.0);
-    joint_msg.position.push_back((gripper_pos_0_100 / 100.0f) * 0.8f);
+    joint_msg.position.push_back((msg.gripper_position / 100.0f) * 0.8f);
+    joint_msg.effort.push_back(msg.gripper_current); // Also put effort in JointState for PlotJuggler
 
     mPubJointState->publish(joint_msg);
 }
@@ -342,6 +348,90 @@ rclcpp_action::CancelResponse Controller::handle_pose_cancel(const std::shared_p
 
 void Controller::handle_pose_accepted(const std::shared_ptr<GoalHandlePose> goal_handle) {
     std::thread{std::bind(&Controller::execute_pose, this, _1), goal_handle}.detach();
+}
+
+// --- Grasp Object Handlers ---
+rclcpp_action::GoalResponse Controller::handle_grasp_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const GripperCommand::Goal>) {
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse Controller::handle_grasp_cancel(const std::shared_ptr<GoalHandleGripper>) {
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+void Controller::handle_grasp_accepted(const std::shared_ptr<GoalHandleGripper> goal_handle) {
+    std::thread{std::bind(&Controller::execute_grasp, this, _1), goal_handle}.detach();
+}
+
+void Controller::execute_grasp(const std::shared_ptr<GoalHandleGripper> goal_handle)
+{
+    const auto goal = goal_handle->get_goal();
+    auto result = std::make_shared<ros2_interfaces::action::GripperCommand::Result>();
+    auto feedback = std::make_shared<ros2_interfaces::action::GripperCommand::Feedback>();
+
+    float target_command = std::max(0.0f, std::min(1.0f, goal->position / 100.0f));
+
+    k_api::Base::GripperCommand command;
+    command.set_mode(k_api::Base::GripperMode::GRIPPER_POSITION);
+    auto finger = command.mutable_gripper()->add_finger();
+    finger->set_finger_identifier(1); 
+    finger->set_value(target_command); 
+
+    try {
+        mBase->SendGripperCommand(command);
+        
+        auto start_time = std::chrono::steady_clock::now();
+        const auto timeout_duration = std::chrono::seconds(5);
+
+        // Allow a brief moment for the motor to start moving
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        while (rclcpp::ok()) {
+            if (goal_handle->is_canceling()) {
+                mBase->Stop();
+                result->success = false;
+                goal_handle->canceled(result);
+                return;
+            }
+
+            auto gripper_feedback = mBaseCyclic->RefreshFeedback().interconnect().gripper_feedback();
+            float current_pos = gripper_feedback.motor()[0].position();
+            float current_motor = gripper_feedback.motor()[0].current_motor();
+            
+            feedback->current_position = current_pos;
+            goal_handle->publish_feedback(feedback);
+
+            // Spike detection logic. You may need to tune this threshold.
+            float current_threshold = 0.5f; 
+            if (std::abs(current_motor) > current_threshold) {
+                RCLCPP_INFO(this->get_logger(), "Object grasped! Current spiked to %.3f A. Stopping gripper.", current_motor);
+                mBase->Stop(); 
+                break;
+            }
+
+            // Check if we hit the full close target without a current spike
+            if (std::abs(current_pos - goal->position) < 1.0f) {
+                RCLCPP_WARN(this->get_logger(), "Gripper reached target position (%.1f) without current spike. Nothing grasped?", current_pos);
+                break;
+            }
+            
+            // Check for timeout
+            auto elapsed_time = std::chrono::steady_clock::now() - start_time;
+            if (elapsed_time > timeout_duration) {
+                RCLCPP_WARN(this->get_logger(), "Grasp action timed out.");
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        result->success = true;
+        goal_handle->succeed(result);
+    } catch (k_api::KDetailedException& ex) {
+        RCLCPP_ERROR(this->get_logger(), "Gripper Error: %s", ex.what());
+        result->success = false;
+        goal_handle->abort(result);
+    }
 }
 
 int main(int argc, char * argv[]) {
