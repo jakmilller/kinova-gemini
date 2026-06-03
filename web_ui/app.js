@@ -126,6 +126,7 @@ voiceBtn.addEventListener('click', function() {
     }
 });
 
+/*
 // Spacebar Press-and-Hold Logic
 let spacebarPressed = false;
 
@@ -155,6 +156,7 @@ window.addEventListener('keyup', function(e) {
         addChatMessage('system', 'Voice recording stopped (Spacebar released).');
     }
 });
+*/
 
 brainStatusListener.subscribe(function(message) {
     const data = message.data;

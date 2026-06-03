@@ -16,12 +16,14 @@
 #include <SessionManager.h>
 #include <RouterClient.h>
 #include <TransportClientTcp.h>
+#include <mutex>
 
 // Custom Interfaces
 #include "ros2_interfaces/msg/robot_state.hpp"
 #include "ros2_interfaces/action/move_to_pose.hpp"
 #include "ros2_interfaces/action/move_to_joints.hpp"
 #include "ros2_interfaces/action/gripper_command.hpp"
+#include "ros2_interfaces/srv/compute_ik.hpp"
 
 namespace k_api = Kinova::Api;
 
@@ -47,6 +49,9 @@ private:
     k_api::BaseCyclic::BaseCyclicClient* mBaseCyclic;
     k_api::ActuatorConfig::ActuatorConfigClient* mActuatorConfig;
 
+    // Mutex for thread-safe API access
+    std::mutex mApiMutex;
+
     // Action Servers
     rclcpp_action::Server<MoveToPose>::SharedPtr mActionPoseServer;
     rclcpp_action::Server<MoveToJoints>::SharedPtr mActionJointsServer;
@@ -55,6 +60,7 @@ private:
 
     // Services
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr mSrvAdmittance;
+    rclcpp::Service<ros2_interfaces::srv::ComputeIK>::SharedPtr mSrvComputeIK;
 
     // Publishers and Timers
     rclcpp::Publisher<ros2_interfaces::msg::RobotState>::SharedPtr mPubState;
@@ -65,7 +71,11 @@ private:
     void toggleAdmittance(const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
                           std::shared_ptr<std_srvs::srv::SetBool::Response> response);
     
+    void computeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
+                   std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response);
+    
     void publishState();
+    float get_gripper_position();
 
     // Action Handlers (Pose)
     rclcpp_action::GoalResponse handle_pose_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveToPose::Goal>);

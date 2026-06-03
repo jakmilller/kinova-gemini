@@ -63,6 +63,18 @@ move_to_position_tool = types.FunctionDeclaration(
     )
 )
 
+move_to_pose_tool = types.FunctionDeclaration(
+    name="move_to_pose",
+    description="Call when you want to execute a complex grasp on a specific object. The system will autonomously determine the best 6D grasp pose and execute it.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "object_label": types.Schema(type="STRING", description="The label or semantic description of the target object to grasp (e.g., 'red block', 'cup handle')."),
+        },
+        required=["object_label"]
+    )
+)
+
 adjust_joints_tool = types.FunctionDeclaration(
     name="adjust_joints",
     description="Call when user requests adjustment to the current joint position (e.g., 'rotate last joint 30 degrees'). Arguments are relative adjustments in degrees to current joint angles.",
@@ -90,7 +102,7 @@ task_complete_tool = types.FunctionDeclaration(
 # --- Tool Collections ---
 
 INSPECTION_TOOLS = [inspect_scene_tool]
-LOW_LEVEL_TOOLS = [move_to_home_tool, move_to_user_tool, grasp_object_tool, open_gripper_tool, move_to_position_tool, adjust_joints_tool]
+LOW_LEVEL_TOOLS = [move_to_home_tool, move_to_user_tool, grasp_object_tool, open_gripper_tool, move_to_position_tool, move_to_pose_tool, adjust_joints_tool]
 HELPER_TOOLS = [task_complete_tool]
 
 ALL_TOOLS = INSPECTION_TOOLS + LOW_LEVEL_TOOLS + HELPER_TOOLS

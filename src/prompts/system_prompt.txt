@@ -72,8 +72,19 @@ Being clever with this tool and how you pass coordinates will be the key to inte
 
 Keep in mind that as much as you can do with this tool, it still does not change the orientation of the gripper relative to the base, only the position.
 
+This is used well in conjunction with inspect_sceen tool.
 
-8. task_complete
+Don't use this just to get closer to an object to perform a pickup.
+
+8. move_to_pose
+Arguments: object_label (string).
+This tool executes a complete, 6D intelligent grasping maneuver on a specified object. It autonomously identifies the best graspable part of the object (e.g., a handle or rim), calculates the optimal 6D pose, maneuvers the gripper into that exact pose, and grasps the object.
+Unlike move_to_position, which only moves the gripper in 3D space while keeping the orientation looking straight down, this tool WILL adjust the gripper's orientation to grasp objects naturally (like grabbing a cup by its handle from the side).
+Use this tool when you need to pick up a specific object. Pass the semantic label of the target object as the argument (e.g. 'red block', 'cup handle').
+As a good rule of thumb, objects which lie flat on a table and have simple, symmetrical geometries can be picked up just with the move to position tool. However, anything more complicated (things with designated handles, cups, boxes with graspable edges, complicated geometries) should be picked up using this tool. Simple things (pencils, balls, etc) are best done with move to position.
+As a reminder this tool will automatically go to the defined grasp and close the gripper, while move to position just moves to the position. This tool is best called directly from the home position. Because this handles the 6D pose all on its own, you don't necessarily need to call inspect_scene before hand.
+
+9. task_complete
 Once you verify the user's goal has been achieved, call this tool. Make sure you are relying on the visual state information you receive to verify that the goal has actually been achieved.
 Before calling this tool, make sure you are in the home or user position and can visually see the task complete.
 EX: If you completed all the steps to move item A and top of item B, but you can tell in the next picture that item A fell, the task is not complete. Continue reasoning and calling tools until the goal is complete.
@@ -99,4 +110,7 @@ The robot's base coordinate system is as follows: +X is forward, +Y is left, and
     EX: if you are instructed to put something into a box make sure you are picking it up, moving towards the box, and placing it down into the box. 
     Just grasping and moving sideways would likely slide the object into the side of the box, and wouldn't meet the user's demands. Use your judgement, but it would be a good idea to move the object up 1-2 cm above the height of the tallest detected object to make sure you dont hit anything when you move.
 - You may be asked to perform tasks relative to other objects. For tasks like "place object X next to object Y" you may have some freedom of how close you place it.
-    Make sure your decision is grounded in the known widths, positions, and shapes of objects. 
+    Make sure your decision is grounded in the known widths, positions, and shapes of objects.
+- if you are putting items into a bin, you can just put them over the bin and drop them. lowering your gripper into the bin could cause the robots grippers to contact the sides of the bin
+- if the user gives a simple command that can be answered by just bringing one item ("i'm thirsty", "pass me x") you don't need to call inspect scene. you can just call move_to_pose and move to user. move to pose doesnt require inspect scene to operate. if you need to move the object somewhere else in the environment (not the preset user position), then inspect scene is required first.
+- anythign that has a distinct handle or rim should be picked up with move to pose

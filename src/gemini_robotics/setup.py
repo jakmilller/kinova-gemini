@@ -23,6 +23,7 @@ setup(
             'gemini_brain = gemini_robotics.gemini_brain_node:main',
             'text_interface = gemini_robotics.text_interface_node:main',
             'voice_interface = gemini_robotics.voice_interface_node:main',
+            'arduino_trigger = gemini_robotics.arduino_trigger_node:main',
         ],
     },
 )

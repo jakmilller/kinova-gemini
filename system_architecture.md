@@ -1,7 +1,7 @@
 # Software Architecture: Gemini-Guided Kinova Gen3 Robotics
 
 ## Overview
-This document describes the modular system architecture where a user can provide natural language instructions, and the **Gemini Robotics** model to orchestrate the robot's actions. The system uses a multi-turn "Reasoning-Action" loop, incorporating live visual feedback from both the physical environment (RealSense) and the robot's digital twin (RViz) to achieve complex, long-horizon tasks.
+This document describes the modular system architecture where a user can provide natural language instructions, and the **Gemini Robotics** model orchestrates the robot's actions. The system uses a multi-turn "Reasoning-Action" loop, incorporating live visual feedback from a wrist-mounted RealSense camera and advanced vision models (SAM 2, AnyGrasp) to achieve complex, long-horizon tasks.
 
 ## Architecture
 
@@ -10,30 +10,30 @@ The central "Brain" of the integration.
 
 *   **`gemini_brain_node.py`**:
     *   **Model Strategy**:
-        *   **Gemini 1.5 Robotics ER**: Model multi-step reasoning and high-precision visual object segmentation. Different Gemini models can be used by editing the `config.yaml` file.
-    *   **Visual Feedback Loop**: Every reasoning turn includes:
-        *   **RealSense View**: RGB image from the arm-mounted camera.
-        *   **RViz Snapshot**: A "third-person" spatial view of the robot, base coordinate system, and the current RealSense pointcloud.
+        *   **Gemini 1.5 Flash**: Orchestrates multi-step reasoning and provides initial object localization via bounding boxes.
+    *   **Vision Stack**:
+        *   **SAM 2**: Refines Gemini's bounding boxes into high-precision segmentation masks.
+        *   **AnyGrasp**: Processes segmented point clouds to detect 6D grasp poses.
     *   **Tool Definitions (Gemini-Callable Functions)**:
-        *   `inspect_scene()`: Triggers the vision pipeline. Returns a semantic report of all objects in the scene, their 3D poses (x, y, z) relative to the base, and an annotated image.
-        *   `move_to_position(x, y, z)`: Moves the end-effector to absolute Cartesian coordinates in meters.
-        *   `move_to_home()`: Returns to the observation pose looking down at the workspace.
-        *   `move_to_user()`: Moves to a pose for hand-over or user interaction.
-        *   `grasp_object()`: Closes the gripper until contact is detected.
+        *   `inspect_scene()`: Triggers the vision pipeline using SAM 2 and depth processing. Returns a semantic report of all objects and their 3D poses.
+        *   `move_to_pose(object_label)`: Executes an autonomous 6D grasp. Combines Gemini, SAM 2, AnyGrasp, and IK.
+        *   `move_to_position(x, y, z)`: Moves the end-effector to absolute Cartesian coordinates.
+        *   `move_to_home()`: Returns to the observation pose.
+        *   `move_to_user()`: Moves to a pose for user interaction.
+        *   `grasp_object()`: Closes the gripper until contact.
         *   `open_gripper()`: Fully opens the gripper.
-        *   `adjust_joints(joint_number, amount)`: Relative adjustment of a specific joint in degrees.
+        *   `adjust_joints(joint_number, amount)`: Relative adjustment of a specific joint.
         *   `task_complete()`: Signals that the user's goal has been reached.
-    *   **Instruction Subscriber**: Listens to `/user_instructions`.
 
 ### 2. Execution Node: `kortex_controller` (C++)
-*   **Role**: Executes low-level ROS 2 Actions (`MoveToPose`, `MoveToJoints`, `GripperCommand`) via the Kinova Kortex API.
+*   **Role**: Executes low-level ROS 2 Actions via the Kinova Kortex API.
+*   **IK Solver**: Provides the `compute_ik` service, which uses the robot's kinematic model to solve for joint angles given a 6D goal pose.
 
 ---
 
 ## System Architecture & Flow
 
 ### 1. High-Level Communication
-The system is built on ROS 2, with the `gemini_brain_node` acting as the central orchestrator, communicating with the hardware and the user interface.
 
 ```mermaid
 graph LR
@@ -43,22 +43,24 @@ graph LR
 
     subgraph Intelligence [gemini_robotics]
         Brain[Gemini Brain Node]
-        ER[Gemini 1.5 ER]
+        SAM2[SAM 2]
+        AG[AnyGrasp]
     end
 
     subgraph Hardware [kortex_controller]
+        IK[ComputeIK Service]
         Kortex[C++ Action Servers]
         Robot[Kinova Gen3]
     end
 
     UI -->|/user_instructions| Brain
     Brain -->|/gemini_chat| UI
+    Brain -->|Request IK| IK
     Brain <-->|ROS 2 Actions| Kortex
     Kortex <-->|Kortex API| Robot
 ```
 
 ### 2. The Reasoning Loop (Inside `gemini_brain_node`)
-This loop runs for every user command, allowing Gemini to "think" and "act" sequentially until the goal is met.
 
 ```mermaid
 graph TD
@@ -66,12 +68,11 @@ graph TD
     Init --> State[Gather Context]
     
     subgraph Context_Gathering
-        State --> Img1[Capture RealSense RGB]
-        State --> Img2[Capture RViz Snapshot]
+        State --> Img[Capture RealSense RGB]
         State --> RobotS[Get Joint/Pose State]
     end
 
-    Context_Gathering --> Gemini[Query Gemini Robotics ER]
+    Context_Gathering --> Gemini[Query Gemini 1.5 Flash]
     Gemini --> Decision{Gemini Output}
     
     Decision -->|Text Response| UI[Publish to Chat UI]
@@ -82,50 +83,35 @@ graph TD
     Feedback --> State
 ```
 
-### 3. Vision Pipeline (`inspect_scene`)
-A specialized sub-flow that converts visual pixels into actionable 3D coordinates.
+### 3. Advanced Grasping Pipeline (`move_to_pose`)
+
+The `move_to_pose` tool represents the most advanced autonomous capability of the system.
 
 ```mermaid
 graph TD
-    Call[inspect_scene Called] --> Cap[Capture RGB + Depth]
-    Cap --> ER[Query Gemini 1.5 ER]
-    ER -->|JSON| Masks[Parse Segmentation Masks]
-    
-    subgraph Math_Processing
-        Masks --> Median[Calculate Median Depth]
-        Median --> Project[Project Pixel to 3D]
-        Project --> TF[Transform to Base Frame]
-    end
-
-    TF --> Report[Generate Semantic Report]
-    Report --> Return[Return Report to Reasoning Loop]
+    Call[move_to_pose Called] --> GemBox[Gemini: Identify Object Part]
+    GemBox --> SAM[SAM 2: Refine Mask]
+    SAM --> PC[Point Cloud Generation]
+    PC --> AG[AnyGrasp: Detect 6D Grasps]
+    AG --> IK[ComputeIK: Solve for Joints]
+    IK --> Move[Execute Movement & Grasp]
 ```
 
 ---
 
-## Technical Execution Deep-Dive
+## Technical Execution Deep-Dive: Autonomous 6D Grasping
 
-The power of this system lies in its **multi-modal feedback loop**. Unlike traditional robotics scripts that follow a fixed path, Gemini dynamically adjusts its plan based on what it "sees" and "feels."
+Unlike simple pick-and-place, the `move_to_pose` tool uses a tiered approach to achieve robust manipulation in unstructured environments:
 
-### Step-by-Step Execution Flow
-
-1.  **Goal Reception**: The user sends a command (e.g., "Grab the red mug"). This is received by the `GeminiBrainNode` via the `/user_instructions` topic.
-2.  **Context Construction**:
-    *   **Vision**: The node grabs the latest frame from the RealSense camera.
-    *   **Spatial Awareness**: It uses `maim` to take a snapshot of the RViz window. This provides Gemini with an observer view of the robot's coordinate system and the surrounding pointcloud.
-    *   **Proprioception**: It reads the exact joint angles and Cartesian coordinates from the `/robot_state` topic.
-3.  **The "Reasoning" Turn**:
-    *   The images and state data are sent to Gemini. 
-    *   The model evaluates the scene against the goal. If it doesn't know where the "red mug" is, it will first call `inspect_scene()`.
-4.  **Embodied Vision (ER)**:
-    *   When `inspect_scene()` is called, the node switches to **Gemini 1.5 ER**.
-    *   `inspect_scene()` uses **Gemini 1.5 ER** to return high-precision segmentation masks. The node then calculates the **Median of Mask** depth—taking all depth pixels within the object's mask and finding the median value to filter out noise.
-    *   This depth is projected into 3D space and then transformed from the `camera_link` to the `base_link` using ROS 2 TF2.
-5.  **Iterative Action**:
-    *   The 3D coordinates are fed back to Gemini, which issues a movement command (e.g., `move_to_position(x, y, z)`).
-    *   The node waits for the C++ `kortex_controller` to complete the action before starting the next turn of the loop.
-6.  **Verification**: After moving, Gemini receives a fresh set of images. It can see if the gripper is actually around the mug. If it missed, it can adjust its joints or try again.
-7.  **Finalization**: Once Gemini perceives that the mug is grasped and the user's ultimate goal is satisfied, it calls `task_complete()`, ending the process.
+1.  **Part Identification (Gemini 1.5 Flash)**: Gemini is prompted to find the "most graspable part" of an object (e.g., the handle of a mug). It returns a normalized bounding box.
+2.  **High-Precision Segmentation (SAM 2)**: The bounding box is passed to SAM 2, which generates a pixel-perfect binary mask. This is crucial for isolating the object from the background and other items.
+3.  **Point Cloud Processing**: Using the RealSense depth map and the SAM 2 mask, the system extracts a dense 3D point cloud of only the target object.
+4.  **6D Grasp Detection (AnyGrasp)**: The segmented point cloud is fed into AnyGrasp. AnyGrasp evaluates thousands of potential gripper poses, considering collisions and grasp quality, and returns the best 6D pose (position + orientation).
+5.  **Inverse Kinematics (IK)**: The 6D pose is sent to the `compute_ik` service (C++). The solver finds the joint angles required to reach that pose. If the first pose is unreachable, the system automatically tries a 180-degree flip of the gripper.
+6.  **Multi-Stage Execution**:
+    *   **Pre-Grasp**: The robot moves to a position slightly offset from the target along the approach vector.
+    *   **Grasp**: The robot slides forward into the final grasp pose.
+    *   **Action**: The gripper is closed, and the object is secured.
 
 ---
 
@@ -133,7 +119,7 @@ The power of this system lies in its **multi-modal feedback loop**. Unlike tradi
 
 ```mermaid
 graph LR
-    subgraph Inspection
+    subgraph Vision
         T1[inspect_scene]
     end
     
@@ -142,34 +128,22 @@ graph LR
         T3[move_to_home]
         T4[move_to_user]
         T5[adjust_joints]
+        T6[move_to_pose]
     end
     
     subgraph Manipulation
-        T6[grasp_object]
-        T7[open_gripper]
+        T7[grasp_object]
+        T8[open_gripper]
     end
     
     subgraph Control
-        T8[task_complete]
+        T9[task_complete]
     end
 
-    Brain((Gemini Brain)) --- Inspection
+    Brain((Gemini Brain)) --- Vision
     Brain --- Motion
     Brain --- Manipulation
     Brain --- Control
 ```
-
----
-
-## Execution Flow: Long-Horizon Task
-*Example: "Put the toy in the box"*
-
-1.  **Reasoning**: Gemini analyzes the goal and calls `inspect_scene()`.
-2.  **Vision**: The pipeline identifies "toy" at `(0.4, -0.1, 0.05)` and "box" at `(0.5, 0.2, 0.1)`.
-3.  **Action 1**: Gemini calls `move_to_position(x=0.4, y=-0.1, z=0.05)`.
-4.  **Action 2**: Gemini calls `grasp_object()`.
-5.  **Action 3**: Gemini calls `move_to_position(x=0.5, y=0.2, z=0.2)` (moving above the box).
-6.  **Action 4**: Gemini calls `open_gripper()`.
-7.  **Finalize**: Gemini calls `task_complete()`.
 
 

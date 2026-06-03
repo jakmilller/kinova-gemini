@@ -22,6 +22,32 @@ import base64
 from io import BytesIO
 from PIL import Image as PILImage, ImageDraw, ImageFont, ImageColor
 
+import sys
+import argparse
+import torch
+from scipy.spatial.transform import Rotation as R
+from ros2_interfaces.srv import ComputeIK
+
+# AnyGrasp imports
+workspace_path = os.path.expanduser('~/kinova-gemini')
+sys.path.append(os.path.join(workspace_path, 'anygrasp_sdk'))
+sys.path.append(os.path.join(workspace_path, 'anygrasp_sdk', 'grasp_detection'))
+try:
+    from gsnet import AnyGrasp
+except ImportError as e:
+    print(f"Error importing AnyGrasp: {e}")
+
+# SAM2 imports
+sam2_repo_path = "/home/mcrr-lab/raf-live/SAM2_streaming"
+sys.path.append(sam2_repo_path)
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    SAM2_AVAILABLE = True
+except ImportError as e:
+    print(f"Error importing SAM2: {e}")
+    SAM2_AVAILABLE = False
+
 # We can import the existing controller client
 from .robot_controller_ros2 import KinovaRobotControllerROS2
 from . import vision_utils
@@ -51,6 +77,29 @@ class GeminiBrainNode(Node):
 
         # for tasks requiring embodied reasoning/vision
         self.robot_model_id = self.robot_config['model']['robot']
+
+        # --- Initialize Models ---
+        self.get_logger().info('Initializing AnyGrasp...')
+        args = argparse.Namespace()
+        args.checkpoint_path = os.path.join(workspace_path, 'anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar')
+        args.max_gripper_width = 0.14
+        args.gripper_height = 0.07
+        args.top_down_grasp = False
+        args.debug = False
+        
+        self.anygrasp = AnyGrasp(args)
+        self.anygrasp.load_net()
+
+        if SAM2_AVAILABLE:
+            self.get_logger().info('Initializing SAM2...')
+            sam2_checkpoint = os.path.join(sam2_repo_path, "checkpoints/sam2/sam2_hiera_large.pt")
+            sam2_model_cfg = "sam2/sam2_hiera_l.yaml"
+            self.sam_predictor = SAM2ImagePredictor(build_sam2(sam2_model_cfg, sam2_checkpoint, device="cuda"))
+        else:
+            self.sam_predictor = None
+
+        self.ik_cb_group = MutuallyExclusiveCallbackGroup()
+        self.ik_client = self.create_client(ComputeIK, 'compute_ik', callback_group=self.ik_cb_group)
 
         # --- Robot Controller ---
         self.controller = KinovaRobotControllerROS2()
@@ -116,7 +165,7 @@ class GeminiBrainNode(Node):
         self.tools = [types.Tool(function_declarations=gemini_tools.ALL_TOOLS)]
 
         self.chat_session = self.client.chats.create(
-            model=self.robot_model_id,
+            model=self.flash_model_id,
             config=types.GenerateContentConfig(
                 system_instruction=self.system_prompt,
                 tools=self.tools,
@@ -198,7 +247,7 @@ class GeminiBrainNode(Node):
         self.command_start_time = start_time # Track total command time
 
         loop_count = 0
-        max_loops = 20
+        max_loops = 30
         current_message = f"User Goal: {user_text}"
         current_image = None
 
@@ -238,33 +287,34 @@ class GeminiBrainNode(Node):
                 prompt.append(img_resized)
 
             # 2. Capture and append RViz snapshot for spatial context
-            try:
-                # Find ONLY visible RViz window IDs
-                window_search = subprocess.check_output(['xdotool', 'search', '--onlyvisible', '--name', 'RViz']).decode().split()
-                if window_search:
-                    # Use the last visible window found (often the main one)
-                    window_id = window_search[-1]
-                    snapshot_path = '/tmp/rviz_snapshot.png'
+            # because the camera is wrist mounted, i though the Rviz screenshot could provide cool spatial context without a scene camera, however perrformance is fine and quicker without this
+            # try:
+            #     # Find ONLY visible RViz window IDs
+            #     window_search = subprocess.check_output(['xdotool', 'search', '--onlyvisible', '--name', 'RViz']).decode().split()
+            #     if window_search:
+            #         # Use the last visible window found (often the main one)
+            #         window_id = window_search[-1]
+            #         snapshot_path = '/tmp/rviz_snapshot.png'
                     
-                    # Ensure the file is clean
-                    if os.path.exists(snapshot_path):
-                        os.remove(snapshot_path)
+            #         # Ensure the file is clean
+            #         if os.path.exists(snapshot_path):
+            #             os.remove(snapshot_path)
                     
-                    # Take snapshot using maim (best for OpenGL/RViz)
-                    # -i specifies the window ID
-                    subprocess.run(['maim', '-i', window_id, snapshot_path], check=True)
+            #         # Take snapshot using maim (best for OpenGL/RViz)
+            #         # -i specifies the window ID
+            #         subprocess.run(['maim', '-i', window_id, snapshot_path], check=True)
                     
-                    if os.path.exists(snapshot_path):
-                        rviz_img = PILImage.open(snapshot_path)
-                        # Resize for token efficiency
-                        rw, rh = rviz_img.size
-                        nrw = 800
-                        nrh = int(nrw * rh / rw)
-                        rviz_resized = rviz_img.resize((nrw, nrh), PILImage.Resampling.LANCZOS)
-                        prompt.append("RViz Visualization (Spatial Context):")
-                        prompt.append(rviz_resized)
-            except Exception as e:
-                self.get_logger().warn(f"Could not capture RViz snapshot: {e}")
+            #         if os.path.exists(snapshot_path):
+            #             rviz_img = PILImage.open(snapshot_path)
+            #             # Resize for token efficiency
+            #             rw, rh = rviz_img.size
+            #             nrw = 800
+            #             nrh = int(nrw * rh / rw)
+            #             rviz_resized = rviz_img.resize((nrw, nrh), PILImage.Resampling.LANCZOS)
+            #             prompt.append("RViz Visualization (Spatial Context):")
+            #             prompt.append(rviz_resized)
+            # except Exception as e:
+            #     self.get_logger().warn(f"Could not capture RViz snapshot: {e}")
 
             if current_image:
                 prompt.append(current_image)
@@ -319,6 +369,184 @@ class GeminiBrainNode(Node):
         processing_time = time.time() - start_time
         self.get_logger().info(f"Total task time: {processing_time:.4f} seconds\n")
 
+    async def move_to_pose(self, object_label):
+        self.get_logger().info(f"Executing 6D Grasp for: {object_label}")
+        
+        for _ in range(10):
+            if self.latest_rgb_image is not None and self.latest_depth_image is not None and self.latest_camera_info is not None and self.latest_robot_state is not None:
+                break
+            time.sleep(0.5)
+            
+        if self.latest_rgb_image is None: return False, "No RGB image"
+
+        cv_image_rgb = cv2.cvtColor(self.latest_rgb_image, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(cv_image_rgb)
+        
+        prompt = f"Identify the most easily graspable part of the '{object_label}' (e.g. handle, rim, or the whole body if it is small). Return ONLY a JSON with a bounding box in [ymin, xmin, ymax, xmax] format (normalized 0-1000): {{\"box_2d\": [ymin, xmin, ymax, xmax], \"label\": \"part name\"}}"
+        
+        response = self.client.models.generate_content(
+            model=self.flash_model_id,
+            contents=[prompt, pil_img],
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+        )
+        
+        try:
+            res = json.loads(response.text)
+            ymin_norm, xmin_norm, ymax_norm, xmax_norm = res['box_2d']
+            label = res['label']
+            
+            h, w = self.latest_rgb_image.shape[:2]
+            ymin, xmin, ymax, xmax = int(ymin_norm * h / 1000), int(xmin_norm * w / 1000), int(ymax_norm * h / 1000), int(xmax_norm * w / 1000)
+        except Exception as e:
+            return False, f"Gemini box parsing failed: {e}"
+
+        if not self.sam_predictor:
+            return False, "SAM2 not available"
+
+        self.get_logger().info(f"Refining '{label}' segmentation with SAM2 box-prompt...")
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            self.sam_predictor.set_image(cv_image_rgb)
+            input_box = np.array([xmin, ymin, xmax, ymax])
+            masks, _, _ = self.sam_predictor.predict(box=input_box, multimask_output=False)
+        
+        if torch.is_tensor(masks): binary_mask = masks[0].cpu().numpy() > 0
+        else: binary_mask = masks[0] > 0
+
+        box_mask = np.zeros((h, w), dtype=bool)
+        box_mask[max(0, ymin):min(h, ymax), max(0, xmin):min(w, xmax)] = True
+        binary_mask = binary_mask & box_mask
+
+        torch.set_default_dtype(torch.float32)
+        torch.cuda.empty_cache()
+
+        depths = self.latest_depth_image.astype(np.float32)
+        fx, fy = self.latest_camera_info.k[0], self.latest_camera_info.k[4]
+        cx, cy = self.latest_camera_info.k[2], self.latest_camera_info.k[5]
+        scale = 1000.0 
+
+        xmap, ymap = np.meshgrid(np.arange(w), np.arange(h))
+        points_z = depths / scale
+        points_x = (xmap - cx) / fx * points_z
+        points_y = (ymap - cy) / fy * points_z
+        points = np.stack([points_x, points_y, points_z], axis=-1).astype(np.float32)
+        colors = cv_image_rgb.astype(np.float32) / 255.0
+
+        target_points = points[binary_mask].reshape(-1, 3)
+        valid_target_idx = (target_points[:, 2] > 0.1) & (target_points[:, 2] < 1.0)
+        target_points = target_points[valid_target_idx]
+
+        if target_points.shape[0] < 10: return False, "Target point cloud is too small."
+
+        obj_min, obj_max = target_points.min(axis=0), target_points.max(axis=0)
+        margin = 0.005
+        lims = [obj_min[0]-margin, obj_max[0]+margin, obj_min[1]-margin, obj_max[1]+margin, obj_min[2]-margin, obj_max[2]+margin]
+
+        scene_mask = (points[:, :, 2] > 0.2) & (points[:, :, 2] < 0.75)
+        full_points = points[scene_mask].reshape(-1, 3)
+        full_colors = colors[scene_mask].reshape(-1, 3)
+        full_obj_mask = binary_mask[scene_mask]
+        
+        in_lims = (full_points[:, 0] >= lims[0]) & (full_points[:, 0] <= lims[1]) & \
+                  (full_points[:, 1] >= lims[2]) & (full_points[:, 1] <= lims[3]) & \
+                  (full_points[:, 2] >= lims[4]) & (full_points[:, 2] <= lims[5])
+        
+        keep_mask = (in_lims & full_obj_mask) | (~in_lims)
+        points_for_anygrasp = full_points[keep_mask]
+        colors_for_anygrasp = full_colors[keep_mask]
+        
+        torch.cuda.empty_cache()
+        self.get_logger().info("Running AnyGrasp...")
+        gg, _ = self.anygrasp.get_grasp(points_for_anygrasp, colors_for_anygrasp, lims=lims, apply_object_mask=True, dense_grasp=True, collision_detection=True)
+        torch.cuda.empty_cache()
+
+        if len(gg) == 0: return False, "No grasps detected."
+
+        gg = gg.nms().sort_by_score()
+        best_grasp = gg[0]
+        self.get_logger().info(f"Best Grasp: Width={best_grasp.width:.3f}m, Depth={best_grasp.depth:.3f}m")
+
+        desired_width = best_grasp.width + 0.02
+        target_gripper_pos = max(0.0, min(100.0, (0.14 - desired_width) / 0.14 * 100.0))
+        self.get_logger().info(f"Setting gripper to {target_gripper_pos:.1f}%")
+        await self.controller.set_gripper(target_gripper_pos)
+        time.sleep(1.0)
+
+        def transform_to_matrix(t_msg):
+            mat = np.eye(4)
+            q = [t_msg.transform.rotation.x, t_msg.transform.rotation.y, t_msg.transform.rotation.z, t_msg.transform.rotation.w]
+            mat[:3, :3] = R.from_quat(q).as_matrix()
+            mat[0, 3] = t_msg.transform.translation.x; mat[1, 3] = t_msg.transform.translation.y; mat[2, 3] = t_msg.transform.translation.z
+            return mat
+
+        try:
+            t_base_cam = self.tf_buffer.lookup_transform('base_link', self.latest_camera_info.header.frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0))
+        except: return False, "TF lookup failed"
+
+        T_base_cam = transform_to_matrix(t_base_cam)
+        R_align = np.array([[0,0,1],[-1,0,0],[0,-1,0]])
+        T_cam_grasp = np.eye(4); T_cam_grasp[:3,:3] = best_grasp.rotation_matrix; T_cam_grasp[:3,3] = best_grasp.translation
+        T_base_grasp = T_base_cam @ T_cam_grasp
+        r_base_grasp = T_base_grasp[:3,:3] @ R_align
+        grasp_position = T_base_grasp[:3,3]
+
+        try:
+            t_current = self.tf_buffer.lookup_transform('base_link', 'end_effector_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+            R_curr = transform_to_matrix(t_current)[:3, :3]
+            R_flip = r_base_grasp @ R.from_euler('z', 180, degrees=True).as_matrix()
+            def angular_dist(R1, R2):
+                trace = np.trace(np.dot(R1.T, R2))
+                return np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+            if angular_dist(R_curr, R_flip) < angular_dist(R_curr, r_base_grasp): r_base_grasp = R_flip
+        except: pass
+
+        dynamic_offset = 0.0243 * (self.latest_robot_state.gripper_position / 100.0)
+        approach_dist = best_grasp.depth 
+        approach_vector = r_base_grasp[:, 2] 
+        insertion_offset = 0.04 
+
+        # If the target is a cup or bottle, we add a 4cm offset to the insertion 
+        # so the gripper goes deeper into/around the object for a more secure grasp.
+        target_lower = object_label.lower()
+        if "cup" in target_lower or "bottle" in target_lower:
+            insertion_offset += 0.05
+            self.get_logger().info(f"Target '{object_label}' is a cup/bottle, increasing insertion offset to {insertion_offset}m")
+        
+        pre_grasp_palm_pos = grasp_position - (approach_dist + dynamic_offset + 0.02) * approach_vector
+
+        # Solve IK
+        async def solve_ik_with_retry(pos, rot_matrix):
+            if not self.ik_client.wait_for_service(timeout_sec=3.0):
+                self.get_logger().error("ComputeIK service is not available.")
+                return None, None
+
+            euler = R.from_matrix(rot_matrix).as_euler('xyz', degrees=True)
+            req = ComputeIK.Request(); req.x, req.y, req.z = float(pos[0]), float(pos[1]), float(pos[2])
+            req.theta_x, req.theta_y, req.theta_z = float(euler[0]), float(euler[1]), float(euler[2])
+            future = self.ik_client.call_async(req); res = await future
+            if res and res.success: return res.joint_angles, euler
+            rot_flip = rot_matrix @ R.from_euler('z', 180, degrees=True).as_matrix(); euler_flip = R.from_matrix(rot_flip).as_euler('xyz', degrees=True)
+            req.theta_x, req.theta_y, req.theta_z = float(euler_flip[0]), float(euler_flip[1]), float(euler_flip[2])
+            future = self.ik_client.call_async(req); res = await future
+            if res and res.success: return res.joint_angles, euler_flip
+            return None, None
+
+        self.get_logger().info("Calculating and moving to Pre-Grasp...")
+        joint_angles, final_euler = await solve_ik_with_retry(pre_grasp_palm_pos, r_base_grasp)
+        if joint_angles:
+            await self.controller.move_to_joints(joint_angles)
+        else: return False, "IK Failed"
+
+        final_rot_matrix = R.from_euler('xyz', final_euler, degrees=True).as_matrix()
+        final_approach_vector = final_rot_matrix[:, 2]
+        grasp_palm_pos = pre_grasp_palm_pos + (insertion_offset * final_approach_vector)
+        
+        self.get_logger().info("Sliding forward to Grasp...")
+        await self.controller.move_to_pose(grasp_palm_pos[0], grasp_palm_pos[1], grasp_palm_pos[2], final_euler[0], final_euler[1], final_euler[2])
+        self.get_logger().info("Pinching object...")
+        await self.controller.grasp_object()
+
+        return True, ""
+
     async def execute_function(self, function_call):
         name = function_call.name
         args = function_call.args
@@ -372,6 +600,10 @@ class GeminiBrainNode(Node):
                     error_msg = "Robot state not available"
                     success = False
 
+            elif name == "move_to_pose":
+                success, error_msg = await self.move_to_pose(args.get('object_label', 'object'))
+                if success: success_msg = f"Success. Grasped {args.get('object_label', 'object')}."
+
             elif name == "adjust_joints":
                 time.sleep(0.1) # Ensure fresh state
                 if self.latest_robot_state:
@@ -409,8 +641,8 @@ class GeminiBrainNode(Node):
             return full_error, None
 
     async def inspect_scene(self):
-        """Identifies all objects in the scene and returns their 3D poses using high-precision masks."""
-        self.get_logger().info("Performing high-precision scene inspection...")
+        """Identifies all objects in the scene and returns their 3D poses using high-precision masks from SAM2."""
+        self.get_logger().info("Performing high-precision scene inspection with SAM2...")
 
         # 1. Capture Image (Wait for fresh data)
         for _ in range(10):
@@ -436,32 +668,29 @@ class GeminiBrainNode(Node):
         captured_depth = self.latest_depth_image.copy()
         orig_h, orig_w = captured_depth.shape
 
-        # 2. Query Gemini for Masks
+        # 2. Query Gemini for Bounding Boxes
         prompt = textwrap.dedent("""\
             Identify all prominent items in the scene. 
-            For each item, provide a bounding box, a descriptive label, and a segmentation mask.
+            For each item, provide a bounding box and a descriptive label.
             Return the result as a JSON list:
-            [{"box_2d": [ymin, xmin, ymax, xmax], "label": "item name", "mask": "png_base64_str"}]
+            [{"box_2d": [ymin, xmin, ymax, xmax], "label": "item name"}]
             The coordinates are normalized to 0-1000.
             """)
         
         try:
             response = self.client.models.generate_content(
-                model=self.robot_model_id,
+                model=self.flash_model_id,
                 contents=[img_resized, prompt],
-                config=types.GenerateContentConfig(temperature=0.0)
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
             )
             
-            json_output = response.text
-            self.get_logger().info(f"Vision response received. Processing masks...")
-            
-            # Use the segmentation parser from vision_utils
-            masks = vision_utils.parse_segmentation_masks(json_output, img_height=new_height, img_width=new_width)
+            items = json.loads(response.text)
+            self.get_logger().info(f"Vision response received. Found {len(items)} items. Processing SAM2 masks...")
 
-            if not masks:
+            if not items:
                 return True, "No items detected in the scene.", img_resized
 
-            # 3. Process each mask for 3D pose (Median of Mask Math)
+            # 3. Process each item for 3D pose using SAM2
             scene_report = "Scene Inspection Report:\n"
             annotated_img = img_resized.copy()
             
@@ -479,12 +708,34 @@ class GeminiBrainNode(Node):
             if self.latest_camera_info is None:
                 return False, "Camera info not available.", None
 
-            for i, mask_obj in enumerate(masks):
-                label = mask_obj.label
+            for i, item in enumerate(items):
+                if 'label' not in item or 'box_2d' not in item:
+                    continue
+                label = item['label']
+                ymin_norm, xmin_norm, ymax_norm, xmax_norm = item['box_2d']
                 
-                # Upscale mask to original resolution for depth mapping
-                upscaled_mask = cv2.resize(mask_obj.mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                _, binary_mask_orig = cv2.threshold(upscaled_mask, 127, 255, cv2.THRESH_BINARY)
+                ymin = int(ymin_norm * orig_h / 1000)
+                xmin = int(xmin_norm * orig_w / 1000)
+                ymax = int(ymax_norm * orig_h / 1000)
+                xmax = int(xmax_norm * orig_w / 1000)
+                
+                if self.sam_predictor:
+                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        self.sam_predictor.set_image(cv_image_rgb)
+                        input_box = np.array([xmin, ymin, xmax, ymax])
+                        masks, _, _ = self.sam_predictor.predict(box=input_box, multimask_output=False)
+                    
+                    if torch.is_tensor(masks): binary_mask_orig = masks[0].cpu().numpy() > 0
+                    else: binary_mask_orig = masks[0] > 0
+
+                    box_mask = np.zeros((orig_h, orig_w), dtype=bool)
+                    box_mask[max(0, ymin):min(orig_h, ymax), max(0, xmin):min(orig_w, xmax)] = True
+                    binary_mask_orig = binary_mask_orig & box_mask
+                    
+                    torch.set_default_dtype(torch.float32)
+                    torch.cuda.empty_cache()
+                else:
+                    return False, "SAM2 not available.", None
                 
                 # Extract median depth within the mask (robust to noise)
                 object_mask_bool = (binary_mask_orig > 0)
@@ -498,14 +749,14 @@ class GeminiBrainNode(Node):
                 depth_meters = np.median(valid_depths) / 1000.0
 
                 # Calculate Centroid for 3D projection
-                M = cv2.moments(binary_mask_orig)
+                M = cv2.moments(binary_mask_orig.astype(np.uint8))
                 if M["m00"] != 0:
                     pixel_x = int(M["m10"] / M["m00"])
                     pixel_y = int(M["m01"] / M["m00"])
                 else:
                     # Fallback to bbox center
-                    pixel_x = int(((mask_obj.x0 + mask_obj.x1) / 2) * (orig_w / new_width))
-                    pixel_y = int(((mask_obj.y0 + mask_obj.y1) / 2) * (orig_h / new_height))
+                    pixel_x = int((xmin + xmax) / 2)
+                    pixel_y = int((ymin + ymax) / 2)
 
                 # 1. Pixel to 3D in Camera Frame
                 cam_x, cam_y, cam_z = vision_utils.get_3d_point_from_pixel(
@@ -523,19 +774,20 @@ class GeminiBrainNode(Node):
                 colors = ["red", "green", "blue", "yellow", "orange", "pink", "purple", "cyan", "magenta"]
                 color = colors[i % len(colors)]
                 
+                new_ymin = ymin * new_height / orig_h
+                new_xmin = xmin * new_width / orig_w
+                new_ymax = ymax * new_height / orig_h
+                new_xmax = xmax * new_width / orig_w
+                
                 # Draw the box on the resized image
-                box = [mask_obj.y0, mask_obj.x0, mask_obj.y1, mask_obj.x1]
-                draw.rectangle(((box[1], box[0]), (box[3], box[2])), outline=color, width=3)
-                draw.text((box[1] + 5, box[0] + 5), label, fill=color)
+                draw.rectangle(((new_xmin, new_ymin), (new_xmax, new_ymax)), outline=color, width=3)
+                draw.text((new_xmin + 5, new_ymin + 5), label, fill=color)
 
             return True, scene_report, annotated_img
 
         except Exception as e:
             self.get_logger().error(f"Error in inspect_scene: {str(e)}")
             return False, f"Inspection failed: {str(e)}", None
-
-
-
 
 
 def main(args=None):

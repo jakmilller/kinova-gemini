@@ -4,5 +4,6 @@ install/
 log/
 pics/
 src/kortex_controller/kortex_api
+anygrasp_sdk/
 __pycache__/
 *.pyc

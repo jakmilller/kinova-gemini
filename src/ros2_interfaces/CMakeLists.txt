@@ -24,12 +24,17 @@ set(action_files
   "action/MoveToPose.action"
 )
 
+set(srv_files
+  "srv/ComputeIK.srv"
+)
+
 # Generate messages and services
 # The DEPENDENCIES listed here should be the packages whose types are directly
 # included in your .msg or .srv definitions.
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
   ${action_files}
+  ${srv_files}
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs trajectory_msgs builtin_interfaces# Add other direct dependencies like geometry_msgs if needed
 )
 

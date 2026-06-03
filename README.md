@@ -1,29 +1,24 @@
 # Gemini Integration for Kinova Gen3
 
-This repository integrates a 7 DOF Kinova Gen3 robot arm with Google's Gemini models for advanced natural language and vision-guided robotics. The system employs a multi-turn reasoning loop, allowing the robot to perform complex, multi-step tasks like "Pick up the toy and put it in the box."
+This repository integrates a 7 DOF Kinova Gen3 robot arm with Google Gemini for advanced natural language and vision-guided robotics. The system employs a multi-turn reasoning loop, allowing the robot to perform complex, multi-step tasks like "Put the toys away" by calling a variety of custom tools ()
 
 ## High-Level Features
-*   **Model Intelligence**: Uses **Gemini 1.5 Robotics ER** for multi-step reasoning and high-precision visual object segmentation.
-*   **Embodied Awareness**: The model receives live RGB images from an arm-mounted RealSense camera and spatial "third-person" context via RViz snapshots.
+*   **Model Intelligence**: Uses a choice Gemini model (currently Gemini 3 Flash) for multi-step reasoning and precise object identification via bounding boxes.
+*   **Intelligent Grasping**: The new `move_to_pose` tool combines Gemini's semantic understanding, SAM 2's segmentation, and AnyGrasp's 6D pose estimation to execute complex grasps on unstructured objects.
+*   **Advanced Vision**: Integrates **SAM 2 (Segment Anything Model 2)** for high-precision mask refinement and **AnyGrasp** for autonomous 6D grasp detection from point clouds.
+*   **Autonomous Grasping**: The new `move_to_pose` tool combines Gemini's semantic understanding, SAM 2's segmentation, and AnyGrasp's 6D pose estimation to execute complex grasps on unstructured objects.
 *   **Multi-Turn Interaction**: The robot can ask for clarification, perform intermediate inspection steps, and adjust its plan based on visual feedback.
 
 ## Architecture Overview
 
 The system consists of three main components:
-1.  **kortex_controller (C++)**: Low-level execution of robot actions via the Kinova Kortex API.
-2.  **gemini_robotics (Python)**: The central reasoning node. Orchestrates the vision pipeline, manages tool-calling logic, and maintains the conversational state with Gemini.
+1.  **kortex_controller (C++)**: Low-level execution of robot actions via the Kinova Kortex API. Includes a custom **IK Solver** service (`compute_ik`) for 6D pose-to-joint conversion.
+2.  **gemini_robotics (Python)**: The central reasoning node. Orchestrates Gemini 1.5 Flash, SAM 2, and AnyGrasp.
 3.  **Input Interfaces**:
     *   **Web UI**: A modern web interface for text commands and live chat feedback (including annotated images).
-    *   **Voice Interface**: Push-to-talk verbal commands (Spacebar).
+    *   **Voice Interface**: Push-to-talk verbal commands.
 
 For a deep dive into the software design, see [system_architecture.md](system_architecture.md).
-
-## Usage Examples
-The robot is now capable of multi-step tasks:
-*   *"Put the red toy in the blue bin."*
-*   *"Move the apple between the banana and the orange."*
-*   *"Give me the toy on the left."*
-*   *"Clear the table by moving everything to the box."*
 
 ## Prerequisites
 
@@ -35,91 +30,68 @@ The robot is now capable of multi-step tasks:
 ### Software & Dependencies
 *   **OS:** Ubuntu 22.04 or 24.04
 *   **ROS 2:** Humble or Jazzy
-*   **Kinova Kortex API:** Ensure the C++ Kortex API is installed on your system, and placed in `src/kortex_controller`
-*   **ros2_kortex:** The official [ROS 2 packages for Kinova](https://github.com/Kinovarobotics/ros2_kortex). You will need the `kortex_description` package to launch the robot state publisher.
-*   **realsense2_camera:** The official [ROS 2 wrapper for Intel RealSense](https://github.com/realsenseai/realsense-ros).
-  
 *   **Python Dependencies (Conda Environment Recommended):**
-    We recommend using a Conda environment (e.g., `kinova-gemini`) to manage the Python dependencies for the Gemini API and image processing.
     ```bash
     conda create -n kinova-gemini python=3.12
     conda activate kinova-gemini
-    pip install google-genai python-dotenv pyyaml opencv-python pillow numpy
+    pip install google-genai python-dotenv pyyaml opencv-python pillow numpy torch torchvision torchaudio
     ```
+
+#### SAM 2 (Segment Anything Model 2) Installation
+1.  Clone the SAM 2 repository:
+    ```bash
+    git clone https://github.com/facebookresearch/segment-anything-2.git
+    cd segment-anything-2
+    pip install -e .
+    ```
+2.  Download the checkpoints (e.g., `sam2_hiera_large.pt`) and place them in the `checkpoints/` directory.
+3.  Update the `sam2_repo_path` in `gemini_brain_node.py` to match your installation.
+
+#### AnyGrasp SDK Setup
+The system expects the AnyGrasp SDK to be located in the root of the workspace:
+1.  Place the `anygrasp_sdk` folder in `~/kinova-gemini/anygrasp_sdk`.
+2.  Ensure the grasp detection checkpoint is at `anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar`.
+3.  Install AnyGrasp dependencies (refer to AnyGrasp documentation for specific CUDA requirements).
 
 ## Setup & Configuration
 
 1.  **Clone the Repository:**
-    Clone this repository into your ROS 2 workspace `src/` directory.
+    ```bash
+    git clone https://github.com/your-repo/kinova-gemini.git ~/kinova-gemini
+    ```
 
 2.  **API Key Configuration:**
-    Create a `.env` file in the root of your workspace (e.g., `~/kinova-gemini/.env`) and add your Gemini API key:
+    Create a `.env` file in the root of your workspace (`~/kinova-gemini/.env`):
     ```env
     gemini_api_key="YOUR_API_KEY_HERE"
     ```
 
-3.  **Robot Configuration:**
-    Ensure the `config.yaml` file in the root of your workspace has the correct robot IP address and default home joint positions.
+3.  **Pathing in Code:**
+    Ensure the `workspace_path` in `gemini_brain_node.py` points to your project root (default is `~/kinova-gemini`).
 
 ## Building
 
-Build the workspace using `colcon`.
-
 ```bash
-# Source your ROS 2 installation
-source /opt/ros/<distro>/setup.bash
-
-# Build the workspace
 colcon build --symlink-install
-```
-
-### Troubleshooting: Python Shebangs
-Because the Python nodes run inside a Conda environment, you may need to update their shebang lines after building so ROS 2 executes them with the correct Python interpreter. If you encounter module import errors (like `google-genai` not found), run the following to point the scripts to your Conda environment:
-
-```bash
 # Fix the Python shebangs to point to your Conda environment
-sed -i '1s|.*|#!/path/to/your/anaconda3/envs/kinova-gemini/bin/python3|' install/gemini_robotics/lib/gemini_robotics/*
+sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' install/gemini_robotics/lib/gemini_robotics/*
 ```
-*Note: Replace `/path/to/your/anaconda3/...` with the actual path to your Conda environment.*
 
 ## Running the System
 
-You will need multiple separate terminals. In each terminal, be sure to source your ROS 2 installation and your workspace overlay, and activate the conda environment:
-```bash
-source /opt/ros/<distro>/setup.bash
-source install/setup.bash
-conda activate kinova-gemini
-```
-
 **Terminal 1: Launch Core Components**
-Launch the custom controller, robot state publisher, RealSense camera, and UI dependencies.
 ```bash
 ros2 launch kinova_bringup robot.launch.py
 ```
 
 **Terminal 2: Gemini Brain Node**
-Launch the central reasoning node.
 ```bash
 ros2 run gemini_robotics gemini_brain
 ```
 
-**Terminal 3 (optional): Voice Interface**
-Launch the voice command node.
-```bash
-ros2 run gemini_robotics voice_interface
-```
-
 **Web Interface:**
-Open `/path/to/ws/kinova-gemini/web_ui/index.html` in your browser.
-*Hold the **Spacebar** to record a voice command, or use the text interface.*
-
-## Usage Examples
-In the Web Interface, you can try commands like:
-*   *"Put the red toy in the blue bin."*
-*   *"Move the apple between the banana and the orange."*
-*   *"Give me the toy on the left."*
-*   *"Clear the table by moving everything to the box."*
-
+Open `~/kinova-gemini/web_ui/index.html` in your browser.
 
 ## Limitations
-Manipulation has been simplified by keeping the current end-effector orientation before and after the `move_to_position` call (think arcade claw machine). We are currently working on reasoning about the correct object affordances (i.e. picking up a box by the side), as well as adjusting the orientation of the end-effector intelligently.
+*   **Compute Requirements**: Running SAM 2 and AnyGrasp locally requires a modern NVIDIA GPU with at least 8GB of VRAM.
+*   **Workspace Constraints**: The `move_to_pose` tool assumes objects are within the reach of the Kinova arm and visible to the RealSense camera.
