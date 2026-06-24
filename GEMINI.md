@@ -1,25 +1,26 @@
 # Gemini Project: Kinova Gen3 + Gemini Vision Integration
 
-This project integrates a **7 DOF Kinova Gen3 robot** (using the Kortex API) with a **Gemini** model for natural language and vision-guided robotics tasks. The robot has an attached Intel RealSense camera and uses a Robotiq 2F-140 gripper.
+This project integrates a **7 DOF Kinova Gen3 robot** (using the Kortex API) with a **Gemini Live** model for natural language and vision-guided robotics tasks. The robot has an attached Intel RealSense camera and uses a Robotiq 2F-140 gripper.
 
 ## Project Goal
-The goal of this project is to create a robust, natural language interface for a robot arm that can perform complex, multi-step tasks in unstructured environments. By combining high-level reasoning with specialized robotics vision, the system can autonomously perceive its workspace and execute long-horizon pick-and-place or manipulation tasks. The overall goal is to combine the high-level reasoning with task-specific tools so the robot can eventually complete specialized caregiving tasks.
+The goal of this project is to create a robust, natural language interface for a robot arm that can perform complex, multi-step caregiving tasks. By allowing Gemini to call certain robot functions (defined in a Tool Library), the system is able to trasnform user requests into actual robot actions. The overall goal is to combine the high-level reasoning with task-specific caregiving tools (feeding, grooming, etc) to create a general caregiving robot.
 
 ## Project Status
-- **Low-Level Control**: Fully functional ROS 2 action servers in C++ for Joint, Pose, and Gripper control, including a custom IK solver service.
-- **Reasoning Loop**: Functional multi-turn conversational interface using **Gemini 3 Flash**. The model orchestrates tasks, maintains state, and sequences actions.
-- **Advanced Vision**: Integrated **SAM 2 (Segment Anything Model 2)** for high-precision object segmentation and **AnyGrasp** for 6D grasp detection.
-- **Autonomous Grasping**: The `move_to_pose` tool enables the robot to autonomously identify, segment, and execute complex 6D grasps on objects using point-cloud processing and AnyGrasp.
-- **State Feedback**: The model receives live RGB images from RealSense and precise numerical robot state (poses, joints, gripper).
+- **Low-Level Control**: Fully functional ROS 2 action servers in C++ for Joint, Pose, and Gripper control.
+- **Reasoning Loop**: Functional multi-turn conversational interface using **Gemini 3.1 Live**. The model orchestrates tasks, maintains state, and sequences actions.
+- **Advanced Vision and Grasping**: Integrated **SAM 2 (Segment Anything Model 2)** for high-precision object segmentation and **AnyGrasp** for precise 6D grasp detection.
+- **State Feedback**: The model receives live RGB images from RealSense and precise numerical robot state (poses, joints, gripper) once a second.
+- **Web UI**: A local web interface to interact with the robot.
 
 ## Project Overview
 
 - **kortex_controller (C++)**: The core ROS 2 node interfacing with the Kinova hardware. Includes the `compute_ik` service for converting Cartesian poses to joint angles.
-- **gemini_robotics (Python)**: The primary ROS 2 intelligence package.
-    - `gemini_brain_node.py`: The central reasoning center. Uses Gemini 3 Flash (or whatever is in config.yaml) for high-level logic and bounding box generation. Orchestrates SAM 2 and AnyGrasp for vision tasks.
-    - `gemini_tools.py`: Defines the tools available to Gemini (inspect_scene, move_to_pose, move_to_position, etc.).
+- **gemini_live_robotics (Python)**: The primary ROS 2 intelligence package.
+    - `gemini_live_brain_node.py`: The central reasoning center. Uses Gemini Live for high-level logic, receiving state info and user commands to decide the best tool to call. Orchestrates SAM2, AnyGrasp, and more advanced Gemini models for complex vision tasks.
+    - `gemini_live_tools.py`: Defines the tools available to Gemini (inspect_scene, move_to_pose, move_to_position, etc.).
     - `vision_utils.py`: Contains utilities for pixel-to-3D projection and mask parsing.
     - `web_ui/`: A modern graphical interface for chat and visual feedback.
+- **gemini_robotics (Python)**: OUT OF USE. The OLD ROS 2 intelligence package. Still contains some voice interface stuff, but has been replaced by gemini_live_robotics
 - **ros2_interfaces**: Custom ROS 2 action and message definitions (`MoveToPose`, `RobotState`, `ComputeIK`, etc.).
 - **config.yaml**: Model selection, robot settings, and pre-defined positions.
 
@@ -39,19 +40,16 @@ sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' instal
    ```
 2. **Terminal 2: Gemini Brain**
    ```bash
-   ros2 run gemini_robotics gemini_brain
+   ros2 run gemini_live_robotics gemini_live_brain
    ```
-3. **Terminal 3: Voice Interface (also can just type into UI)**
-   ```bash
-   ros2 run gemini_robotics voice_interface
-   ```
+
 
 ## Architecture
 
 1.  **Input**: User commands via Web UI, text, or voice.
-2.  **Reasoning**: A primary Gemini Flash model processes text + images, maintains state, and sequences tool calls.
+2.  **Reasoning**: A primary Gemini Live model processes text + images, maintains state, and sequences tool calls.
 3.  **Vision (SAM 2 & AnyGrasp)**: 
-    - Gemini provides a bounding box for objects.
+    - In some tools, specialized Gemini models provide a bounding box for objects.
     - **SAM 2** refines this into a high-precision segmentation mask.
     - For grasping, **AnyGrasp** processes the segmented point cloud to determine the optimal 6D grasp pose.
 4.  **Kinematics**: The `compute_ik` service (C++) converts the 6D grasp pose into executable joint angles. This is only for the 6D grasps, other grasps move in Cartesian space.
@@ -59,9 +57,9 @@ sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' instal
 
 ## Key Files
 - `src/kortex_controller/src/controller.cpp`: C++ ROS 2 action servers and the `compute_ik` service.
-- `src/gemini_robotics/gemini_robotics/gemini_brain_node.py`: Central reasoning, tool orchestration, and vision pipeline integration (SAM 2, AnyGrasp).
-- `src/gemini_robotics/gemini_robotics/vision_utils.py`: Pixel-to-3D logic and mask parsing utilities.
-- `src/gemini_robotics/gemini_robotics/gemini_tools.py`: Tool definitions (Function Declarations) for the Gemini API.
+- `src/gemini_robotics/gemini_live_robotics/gemini_live_brain_node.py`: Central reasoning, tool orchestration, and vision pipeline integration (SAM 2, AnyGrasp).
+- `src/gemini_robotics/gemini_live_robotics/vision_utils.py`: Pixel-to-3D logic and mask parsing utilities.
+- `src/gemini_robotics/gemini_live_robotics/gemini_live_tools.py`: Tool definitions (Function Declarations) for the Gemini API.
 - `config.yaml`: Model selection, joint positions, and robot configuration parameters.
 - `src/ros2_interfaces/srv/ComputeIK.srv`: Service definition for the Inverse Kinematics solver.
 
@@ -69,12 +67,7 @@ sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' instal
 
 ### Vision & Inspection
 - **`inspect_scene()`**: Performs a semantic analysis of the workspace.
-    1. Gemini 3 Flash generates bounding boxes for all visible objects.
-    2. SAM 2 refines these into high-precision masks.
-    3. Median depth is calculated from the masked point cloud.
-    4. 3D coordinates are projected and transformed to the robot's base frame.
-    5. Returns a text report and an annotated image.
-- **`move_to_pose(object_label)`**: Executes an autonomous 6D grasp on a target object.
+    1. Custom Gemini model (not Gemini Live) on a target object.
     1. Gemini identifies the best part to grasp (e.g., "handle"), and draws a bounding box around it.
     2. SAM 2 segments the part with high precision.
     3. AnyGrasp evaluates the segmented point cloud to find the optimal 6D pose, only considering the object point clouds within the bounding box.

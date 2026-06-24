@@ -22,6 +22,7 @@ set(action_files
   "action/GripperCommand.action"
   "action/MoveToJoints.action"
   "action/MoveToPose.action"
+  "action/PerceptionTask.action"
 )
 
 set(srv_files

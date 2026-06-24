@@ -1,0 +1,143 @@
+robot_cfg:
+  kinematics:
+    urdf_path: "/home/mcrr-lab/kinova-gemini/config/kinova_gen3_robotiq.urdf"
+    asset_root_path: "/home/mcrr-lab/kinova-gemini"
+
+    base_link: "base_link"
+    ee_link: "end_effector_link"
+
+    collision_link_names:
+      - base_link
+      - shoulder_link
+      - half_arm_1_link
+      - half_arm_2_link
+      - forearm_link
+      - spherical_wrist_1_link
+      - spherical_wrist_2_link
+      - bracelet_link
+      - robotiq_140_base_link
+      - left_outer_knuckle
+      - left_outer_finger
+      - left_inner_finger
+      - left_inner_finger_pad
+      - left_inner_knuckle
+      - right_outer_knuckle
+      - right_outer_finger
+      - right_inner_finger
+      - right_inner_finger_pad
+      - right_inner_knuckle
+
+    collision_sphere_buffer: 0.005
+
+    # doesnt recognize 
+    collision_spheres: "/home/mcrr-lab/kinova-gemini/config/spheres/kinova_gen3_robotiq.yml"
+
+    self_collision_buffer:
+      base_link: 0.0
+      shoulder_link: 0.0
+      half_arm_1_link: 0.0
+      half_arm_2_link: 0.0
+      forearm_link: 0.0
+      spherical_wrist_1_link: 0.0
+      spherical_wrist_2_link: 0.0
+      bracelet_link: 0.0
+      robotiq_140_base_link: 0.0
+      left_outer_knuckle: 0.0
+      left_outer_finger: 0.0
+      left_inner_finger: 0.0
+      left_inner_finger_pad: 0.0
+      left_inner_knuckle: 0.0
+      right_outer_knuckle: 0.0
+      right_outer_finger: 0.0
+      right_inner_finger: 0.0
+      right_inner_finger_pad: 0.0
+      right_inner_knuckle: 0.0
+
+    self_collision_ignore:
+      base_link: [shoulder_link]
+      shoulder_link: [half_arm_1_link]
+      half_arm_1_link: [half_arm_2_link]
+      half_arm_2_link: [forearm_link]
+      forearm_link: [spherical_wrist_1_link]
+      spherical_wrist_1_link: [spherical_wrist_2_link]
+      spherical_wrist_2_link: [bracelet_link]
+      bracelet_link: [robotiq_140_base_link]
+      robotiq_140_base_link: [left_outer_knuckle, right_outer_knuckle, left_inner_knuckle, right_inner_knuckle]
+      left_outer_knuckle: [left_outer_finger]
+      left_outer_finger: [left_inner_finger]
+      left_inner_finger: [left_inner_finger_pad]
+      left_inner_knuckle: [left_inner_finger]
+      right_outer_knuckle: [right_outer_finger]
+      right_outer_finger: [right_inner_finger]
+      right_inner_finger: [right_inner_finger_pad]
+      right_inner_knuckle: [right_inner_finger]
+
+    mesh_link_names:
+      - base_link
+      - shoulder_link
+      - half_arm_1_link
+      - half_arm_2_link
+      - forearm_link
+      - spherical_wrist_1_link
+      - spherical_wrist_2_link
+      - bracelet_link
+      - robotiq_140_base_link
+      - left_outer_knuckle
+      - left_outer_finger
+      - left_inner_finger
+      - left_inner_finger_pad
+      - left_inner_knuckle
+      - right_outer_knuckle
+      - right_outer_finger
+      - right_inner_finger
+      - right_inner_finger_pad
+      - right_inner_knuckle
+
+    # finger_joint is the gripper's only real actuator; left_inner_knuckle_joint,
+    # left_inner_finger_joint, right_outer_knuckle_joint, right_inner_knuckle_joint, and
+    # right_inner_finger_joint are URDF <mimic> joints of it. Locking finger_joint here
+    # collapses all 6 into fixed transforms (cuRobo follows the mimic relationship
+    # automatically) - without this, finger_joint is left as an active DOF outside the
+    # planned cspace and kinematics setup fails with "'finger_joint' is not in list".
+    # 0.0 = fully open (matches the gripper pose collision spheres were fit at).
+    lock_joints: {"finger_joint": 0.0}
+
+    cspace:
+      joint_names:
+        - "joint_1"
+        - "joint_2"
+        - "joint_3"
+        - "joint_4"
+        - "joint_5"
+        - "joint_6"
+        - "joint_7"
+
+      retract_config: [0.0, 5.93844, 3.12414, 3.946974, 6.256569, 5.752404, 1.607623] # home position in radians
+      null_space_weight: [2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # try to reduce base moving a bit
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      # The robot's configured operational speed/safety limits (checked via the Kinova web
+      # app's Speed Limits -> Advanced -> Angular trajectory table) are well below the URDF's
+      # raw hardware-rated joint limits, so cuRobo was planning trajectories the firmware's
+      # WaypointList validator then rejected (INVALID_SPEED/INVALID_ACCELERATION). joints 1-4
+      # use "large" actuators, joints 5-7 use "small" wrist actuators with different (higher)
+      # accel limits - both confirmed by the validator's rejection messages
+      # (~51.566/~515.662 deg/s^2 accel ceilings). max_acceleration is in rad/s^2; values
+      # below include a safety margin under the validator's reported limits
+      # (0.8999/9.0001 rad/s^2 exactly) and are unchanged by the web app's angular trajectory
+      # speed increase below (accel limits were not touched).
+      # Lowered ~22% below the firmware's ValidateWaypointList ceilings (0.8999/9.0001 rad/s^2)
+      # so the firmware's finite-difference acceleration re-derivation can't overshoot.
+      max_acceleration: [0.7, 0.7, 0.7, 0.7, 7.0, 7.0, 7.0]
+      # velocity_scale multiplies each joint's URDF-rated max velocity (1.3963 rad/s for
+      # joints 1-4, 1.2218 rad/s for joints 5-7) down to the robot's actual configured cap.
+      # The web app's Angular trajectory speed limit was raised from ~25 deg/s to 50 deg/s
+      # (exactly 2x) for every joint, acceleration limits unchanged - so these values were
+      # doubled from their previous [0.30,0.30,0.30,0.30,0.34,0.34,0.34] to preserve the same
+      # safety margin ratio under the new ceiling (velocity_scale is a relative multiplier
+      # against the URDF max, not an absolute value like max_acceleration, so doubling it
+      # tracks a doubled firmware ceiling exactly - unlike max_acceleration, which is already
+      # an absolute pre-validated number and must never simply be doubled).
+      # New effective caps: joints 1-4 ~48.0 deg/s (0.60 * 1.3963 rad/s), joints 5-7
+      # ~47.6 deg/s (0.68 * 1.2218 rad/s) - both ~4% under the new 50 deg/s ceiling, matching
+      # the original ~4% margin used at the 25 deg/s ceiling.
+      velocity_scale: [0.55, 0.55, 0.55, 0.55, 0.62, 0.62, 0.62]

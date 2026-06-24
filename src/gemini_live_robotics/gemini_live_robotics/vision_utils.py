@@ -97,7 +97,6 @@ def plot_bounding_boxes(img, bounding_boxes_json):
              # Convert normalized coordinates to absolute coordinates
             abs_y = int(bounding_box["point"][0] / 1000 * height)
             abs_x = int(bounding_box["point"][1] / 1000 * width)
-            
             # Draw point
             draw.ellipse((abs_x - 5, abs_y - 5, abs_x + 5, abs_y + 5), fill=color, outline=color)
             

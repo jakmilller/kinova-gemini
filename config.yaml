@@ -1,23 +1,35 @@
 # configurable settings
 model:
-  flash: "gemini-3.1-flash-lite" # currently used
+  flash: "gemini-3.1-pro-preview" # currently used
 
-  robot: "gemini-3.1-flash-lite"
+  live: "gemini-3.1-flash-live-preview"
+
+  #robot: "gemini-3.1-flash-lite"
   # other models
         # gemini-robotics-er-1.5-preview
         # gemini-2.5-flash-lite
+        # gemini-3.1-pro-preview
         # gemini-3-pro-preview
         # gemini-3-flash-preview
 
 joint positions:
-  home: # overlook position
-  - 1.50153386592865
-  - 340.23284912109375
-  - 179.30038452148438
-  - 226.12844848632812
-  - 358.47509765625
-  - 329.6204528808594
-  - 92.11446380615234
+  home: 
+  - 0.0
+  - 340.2477111816406
+  - 179.29942321777344
+  - 226.14500427246094
+  - 358.47503662109375
+  - 329.5884704589844
+  - 92.11003875732422
+
+
+  # - 1.50153386592865 for straight out
+  # - 340.23284912109375
+  # - 179.30038452148438
+  # - 226.12844848632812
+  # - 358.47509765625
+  # - 329.6204528808594
+  # - 92.11446380615234
 
 
     # - 359.9328308105469

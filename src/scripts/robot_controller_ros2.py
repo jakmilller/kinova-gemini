@@ -38,10 +38,24 @@ class KinovaRobotControllerROS2(Node):
             RobotState, 'robot_state', self._state_callback, 10)
         self.current_state = None
 
+        # --- Active Goals for Cancellation ---
+        self._active_goals = []
+
         self.get_logger().info('Minimal Kinova Action Controller Initialized')
 
     def _state_callback(self, msg):
         self.current_state = msg
+
+    async def _await_rclpy_future(self, rclpy_future):
+        """Converts an rclpy.task.Future to an asyncio.Future to prevent deadlocking the asyncio event loop."""
+        loop = asyncio.get_running_loop()
+        asyncio_future = loop.create_future()
+        
+        def callback(future):
+            loop.call_soon_threadsafe(asyncio_future.set_result, future.result())
+            
+        rclpy_future.add_done_callback(callback)
+        return await asyncio_future
 
     async def move_to_pose(self, x, y, z, theta_x=0.0, theta_y=0.0, theta_z=0.0, speed=0.1):
         """Sends a MoveToPose action goal."""
@@ -97,8 +111,19 @@ class KinovaRobotControllerROS2(Node):
             self.get_logger().error('Admittance service not available')
             return False
             
-        result = await self.admittance_client.call_async(request)
+        result = await self._await_rclpy_future(self.admittance_client.call_async(request))
         return result.success
+
+    async def stop_robot(self):
+        """Cancels any active goals to stop the physical robot safely."""
+        self.get_logger().info('Stopping the robot by canceling all active goals.')
+        for goal_handle in self._active_goals:
+            try:
+                await self._await_rclpy_future(goal_handle.cancel_goal_async())
+            except Exception as e:
+                self.get_logger().error(f'Error canceling goal: {e}')
+        self._active_goals.clear()
+        return True
 
     async def _send_action_goal(self, client, goal_msg):
         """Generic internal helper to send action goals and wait for results."""
@@ -106,16 +131,21 @@ class KinovaRobotControllerROS2(Node):
             self.get_logger().error(f'Action server {client._action_name} not available')
             return False
 
-        send_goal_future = await client.send_goal_async(goal_msg)
+        goal_handle = await self._await_rclpy_future(client.send_goal_async(goal_msg))
 
-        if not send_goal_future.accepted:
+        if not goal_handle.accepted:
             self.get_logger().error('Goal rejected by server')
             return False
 
+        self._active_goals.append(goal_handle)
+
         self.get_logger().info('Goal accepted, waiting for result...')
-        result_future = await send_goal_future.get_result_async()
+        result = await self._await_rclpy_future(goal_handle.get_result_async())
         
-        return result_future.result.success
+        if goal_handle in self._active_goals:
+            self._active_goals.remove(goal_handle)
+            
+        return result.result.success
 
 async def main(args=None):
     rclpy.init(args=args)

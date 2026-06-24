@@ -20,6 +20,7 @@ const performanceBox = document.getElementById('performance-box');
 const completionTimeEl = document.getElementById('completion-time');
 
 let lastCommandStartTime = 0;
+let lastJointAngles = null;
 
 // Connection Callbacks
 ros.on('connection', function() {
@@ -92,80 +93,49 @@ const voiceStatusText = document.getElementById('voice-status-text');
 const voiceBtn = document.getElementById('voice-btn');
 let isRecording = false;
 
-voiceStatusListener.subscribe(function(message) {
-    const status = message.data;
-    if (status === 'IDLE') {
-        voiceStatusIndicator.classList.add('hidden');
-        voiceBtn.classList.remove('text-red-600', 'animate-pulse');
-        voiceBtn.classList.add('text-gray-400');
-        isRecording = false;
-    } else {
-        voiceStatusIndicator.classList.remove('hidden');
-        voiceStatusText.textContent = `Voice: ${status}`;
-        
-        if (status === 'LISTENING') {
-            voiceBtn.classList.add('text-red-600', 'animate-pulse');
-            voiceBtn.classList.remove('text-gray-400');
-            isRecording = true;
-        } else if (status === 'PROCESSING') {
+if (voiceStatusListener && voiceStatusIndicator && voiceStatusText && voiceBtn) {
+    voiceStatusListener.subscribe(function(message) {
+        const status = message.data;
+        if (status === 'IDLE') {
+            voiceStatusIndicator.classList.add('hidden');
             voiceBtn.classList.remove('text-red-600', 'animate-pulse');
-            voiceBtn.classList.add('text-blue-600');
+            voiceBtn.classList.add('text-gray-400');
+            isRecording = false;
+        } else {
+            voiceStatusIndicator.classList.remove('hidden');
+            voiceStatusText.textContent = `Voice: ${status}`;
+            
+            if (status === 'LISTENING') {
+                voiceBtn.classList.add('text-red-600', 'animate-pulse');
+                voiceBtn.classList.remove('text-gray-400');
+                isRecording = true;
+            } else if (status === 'PROCESSING') {
+                voiceBtn.classList.remove('text-red-600', 'animate-pulse');
+                voiceBtn.classList.add('text-blue-600');
+            }
         }
-    }
-});
-
-voiceBtn.addEventListener('click', function() {
-    isRecording = !isRecording;
-    const msg = new ROSLIB.Message({
-        data: isRecording
     });
-    voiceTriggerTopic.publish(msg);
-    
-    if (isRecording) {
-        addChatMessage('system', 'Voice command triggered...');
-    }
-});
 
-/*
-// Spacebar Press-and-Hold Logic
-let spacebarPressed = false;
-
-window.addEventListener('keydown', function(e) {
-    // Only trigger if spacebar is pressed AND we are not already recording
-    // AND the user is not currently typing in the command input field
-    if (e.code === 'Space' && !spacebarPressed && document.activeElement !== commandInput) {
-        e.preventDefault(); // Prevent scrolling down the page
-        spacebarPressed = true;
-        
+    voiceBtn.addEventListener('click', function() {
+        isRecording = !isRecording;
         const msg = new ROSLIB.Message({
-            data: true
+            data: isRecording
         });
         voiceTriggerTopic.publish(msg);
-        addChatMessage('system', 'Voice recording started (Spacebar held)...');
-    }
-});
-
-window.addEventListener('keyup', function(e) {
-    if (e.code === 'Space' && spacebarPressed) {
-        spacebarPressed = false;
         
-        const msg = new ROSLIB.Message({
-            data: false
-        });
-        voiceTriggerTopic.publish(msg);
-        addChatMessage('system', 'Voice recording stopped (Spacebar released).');
-    }
-});
-*/
+        if (isRecording) {
+            addChatMessage('system', 'Voice command triggered...');
+        }
+    });
+}
 
 brainStatusListener.subscribe(function(message) {
     const data = message.data;
-    // We can still use brain status for latency or terminal-like logs
     
     // Check for latency report (time to start of move)
     if (data.includes('LATENCY:')) {
         const timeMatch = data.match(/LATENCY: ([\d.]+)s/);
-        if (timeMatch) {
+        if (timeMatch && performanceBox && completionTimeEl) {
             performanceBox.classList.remove('hidden');
             completionTimeEl.textContent = timeMatch[1] + 's';
         }
@@ -188,17 +158,23 @@ const robotStateListener = new ROSLIB.Topic({
 });
 
 robotStateListener.subscribe(function(message) {
-    statePosition.textContent = `${message.x.toFixed(3)}, ${message.y.toFixed(3)}, ${message.z.toFixed(3)}`;
-    stateOrientation.textContent = `${message.theta_x.toFixed(3)}, ${message.theta_y.toFixed(3)}, ${message.theta_z.toFixed(3)}`;
-    
-    const gripperVal = message.gripper_position.toFixed(1);
-    stateGripper.textContent = `${gripperVal}%`;
-    const gripperBar = document.getElementById('gripper-bar');
-    if (gripperBar) {
-        gripperBar.style.width = `${gripperVal}%`;
+    if (statePosition) {
+        statePosition.textContent = `${message.x.toFixed(3)}, ${message.y.toFixed(3)}, ${message.z.toFixed(3)}`;
+    }
+    if (stateOrientation) {
+        stateOrientation.textContent = `${message.theta_x.toFixed(3)}, ${message.theta_y.toFixed(3)}, ${message.theta_z.toFixed(3)}`;
     }
     
-    if (message.joint_angles && message.joint_angles.length >= 7) {
+    if (stateGripper) {
+        const gripperVal = message.gripper_position.toFixed(1);
+        stateGripper.textContent = `${gripperVal}%`;
+        const gripperBar = document.getElementById('gripper-bar');
+        if (gripperBar) {
+            gripperBar.style.width = `${gripperVal}%`;
+        }
+    }
+    
+    if (stateJoints && message.joint_angles && message.joint_angles.length >= 7) {
         stateJoints.innerHTML = message.joint_angles.map((j, i) => `
             <div class="flex justify-between border-b border-gray-50 pb-1">
                 <span class="text-gray-400 font-bold uppercase">J${i+1}</span>
@@ -206,43 +182,67 @@ robotStateListener.subscribe(function(message) {
             </div>
         `).join('');
     }
-});
 
-// Handle Command Submission
-commandForm.addEventListener('submit', function(e) {
-    e.preventDefault();
-    const cmd = commandInput.value.trim();
-    if (cmd) {
-        const msg = new ROSLIB.Message({
-            data: cmd
-        });
-        instructionsTopic.publish(msg);
-        // We'll let the brain node echo this back through /gemini_chat for consistency
-        // but adding it here manually for instant feedback if desired
-        // addChatMessage('user', cmd); 
-        commandInput.value = '';
-        
-        // Reset timer display for new command
-        performanceBox.classList.add('hidden');
-        completionTimeEl.textContent = '...';
+    // Dynamic Client-side Movement State Estimation
+    let isMoving = false;
+    if (lastJointAngles && message.joint_angles) {
+        const diffs = message.joint_angles.map((angle, i) => Math.abs(angle - lastJointAngles[i]));
+        isMoving = diffs.some(diff => diff > 0.05);
+    }
+    lastJointAngles = message.joint_angles;
+
+    const movingEl = document.getElementById('state-moving');
+    if (movingEl) {
+        if (isMoving) {
+            movingEl.textContent = 'Moving';
+            movingEl.className = 'px-3 py-1 rounded font-black uppercase text-[10px] tracking-wider bg-yellow-100 text-yellow-800 animate-pulse border border-yellow-200';
+        } else {
+            movingEl.textContent = 'Stationary';
+            movingEl.className = 'px-3 py-1 rounded font-black uppercase text-[10px] tracking-wider bg-green-100 text-green-800 border border-green-200';
+        }
     }
 });
 
-// Handle E-Stop
-estopBtn.addEventListener('click', function() {
-    const msg = new ROSLIB.Message({
-        data: 'Stop immediately!'
+// Handle Command Submission
+if (commandForm && commandInput) {
+    commandForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        const cmd = commandInput.value.trim();
+        if (cmd) {
+            const msg = new ROSLIB.Message({
+                data: cmd
+            });
+            instructionsTopic.publish(msg);
+            commandInput.value = '';
+            
+            // Reset timer display for new command
+            if (performanceBox && completionTimeEl) {
+                performanceBox.classList.add('hidden');
+                completionTimeEl.textContent = '...';
+            }
+        }
     });
-    instructionsTopic.publish(msg); // Both brain and controller listen to this for stop
-    addChatMessage('system', 'EMERGENCY STOP ISSUED!');
-    
-    // Visual feedback for e-stop
-    estopBtn.classList.add('bg-red-800');
-    setTimeout(() => estopBtn.classList.remove('bg-red-800'), 500);
-});
+}
+
+// Handle E-Stop
+if (estopBtn) {
+    estopBtn.addEventListener('click', function() {
+        const msg = new ROSLIB.Message({
+            data: 'Stop immediately!'
+        });
+        instructionsTopic.publish(msg); // Both brain and controller listen to this for stop
+        addChatMessage('system', 'EMERGENCY STOP ISSUED!');
+        
+        // Visual feedback for e-stop
+        estopBtn.classList.add('bg-red-800');
+        setTimeout(() => estopBtn.classList.remove('bg-red-800'), 500);
+    });
+}
 
 // Helper: Add message to chat container
 function addChatMessage(role, text, image = null) {
+    if (!chatContainer) return;
+
     const messageEl = document.createElement('div');
     messageEl.classList.add('message', `message-${role}`);
     

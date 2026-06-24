@@ -1,19 +1,17 @@
 # Gemini Integration for Kinova Gen3
 
-This repository integrates a 7 DOF Kinova Gen3 robot arm with Google Gemini for advanced natural language and vision-guided robotics. The system employs a multi-turn reasoning loop, allowing the robot to perform complex, multi-step tasks like "Put the toys away" by calling a variety of custom tools ()
+This repository integrates a 7 DOF Kinova Gen3 robot arm with Google Gemini for advanced natural language and vision-guided robotics. The system synthesizes user instructions with robot state knowledge, allowing the robot to perform complex, multi-step tasks like "Put the toys away" by calling a variety of custom tools (using the Kortex API to move the robot).
 
 ## High-Level Features
-*   **Model Intelligence**: Uses a choice Gemini model (currently Gemini 3 Flash) for multi-step reasoning and precise object identification via bounding boxes.
+*   **Model Intelligence**: Uses a Gemini 3 Flash for multi-step reasoning and 
 *   **Intelligent Grasping**: The new `move_to_pose` tool combines Gemini's semantic understanding, SAM 2's segmentation, and AnyGrasp's 6D pose estimation to execute complex grasps on unstructured objects.
-*   **Advanced Vision**: Integrates **SAM 2 (Segment Anything Model 2)** for high-precision mask refinement and **AnyGrasp** for autonomous 6D grasp detection from point clouds.
-*   **Autonomous Grasping**: The new `move_to_pose` tool combines Gemini's semantic understanding, SAM 2's segmentation, and AnyGrasp's 6D pose estimation to execute complex grasps on unstructured objects.
 *   **Multi-Turn Interaction**: The robot can ask for clarification, perform intermediate inspection steps, and adjust its plan based on visual feedback.
 
 ## Architecture Overview
 
 The system consists of three main components:
 1.  **kortex_controller (C++)**: Low-level execution of robot actions via the Kinova Kortex API. Includes a custom **IK Solver** service (`compute_ik`) for 6D pose-to-joint conversion.
-2.  **gemini_robotics (Python)**: The central reasoning node. Orchestrates Gemini 1.5 Flash, SAM 2, and AnyGrasp.
+2.  **gemini_live_robotics (Python)**: The central reasoning node. Orchestrates Gemini 3 Flash with the custom Kortex tools to move the robot.
 3.  **Input Interfaces**:
     *   **Web UI**: A modern web interface for text commands and live chat feedback (including annotated images).
     *   **Voice Interface**: Push-to-talk verbal commands.
@@ -67,14 +65,14 @@ The system expects the AnyGrasp SDK to be located in the root of the workspace:
     ```
 
 3.  **Pathing in Code:**
-    Ensure the `workspace_path` in `gemini_brain_node.py` points to your project root (default is `~/kinova-gemini`).
+    Ensure the `workspace_path` in `gemini_live_brain_node.py` points to your project root (default is `~/kinova-gemini`).
 
 ## Building
 
 ```bash
 colcon build --symlink-install
 # Fix the Python shebangs to point to your Conda environment
-sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' install/gemini_robotics/lib/gemini_robotics/*
+sed -i '1s|.*|#!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3|' install/gemini_live_robotics/lib/gemini_live_robotics/*
 ```
 
 ## Running the System
@@ -86,7 +84,7 @@ ros2 launch kinova_bringup robot.launch.py
 
 **Terminal 2: Gemini Brain Node**
 ```bash
-ros2 run gemini_robotics gemini_brain
+ros2 run gemini_live_robotics gemini_live_brain
 ```
 
 **Web Interface:**
