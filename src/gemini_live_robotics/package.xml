@@ -3,9 +3,9 @@
 <package format="3">
   <name>gemini_live_robotics</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Gemini Live reasoning + vision pipeline and push-to-talk voice I/O for the Kinova Gen3 arm.</description>
   <maintainer email="jmill.pro1@gmail.com">mcrr-lab</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>

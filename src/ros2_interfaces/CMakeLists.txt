@@ -10,8 +10,6 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(trajectory_msgs REQUIRED)
-# Add other find_package calls here if your interfaces use types from them (e.g., geometry_msgs)
 
 # Specify the message files
 set(msg_files
@@ -22,11 +20,6 @@ set(action_files
   "action/GripperCommand.action"
   "action/MoveToJoints.action"
   "action/MoveToPose.action"
-  "action/PerceptionTask.action"
-)
-
-set(srv_files
-  "srv/ComputeIK.srv"
 )
 
 # Generate messages and services
@@ -35,8 +28,7 @@ set(srv_files
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
   ${action_files}
-  ${srv_files}
-  DEPENDENCIES std_msgs sensor_msgs geometry_msgs trajectory_msgs builtin_interfaces# Add other direct dependencies like geometry_msgs if needed
+  DEPENDENCIES std_msgs sensor_msgs geometry_msgs builtin_interfaces
 )
 
 # ament_auto_package handles a lot of the boilerplate for exporting

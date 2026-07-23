@@ -6,6 +6,8 @@
 #include "ros2_interfaces/action/move_to_pose.hpp"
 #include "ros2_interfaces/action/move_to_joints.hpp"
 #include "ros2_interfaces/action/gripper_command.hpp"
+#include <geometry_msgs/msg/point.hpp>
+#include <yaml-cpp/yaml.h>
 
 using namespace std;
 using namespace std::placeholders;
@@ -16,7 +18,8 @@ Controller::Controller() : Node("kinova_controller")
     this->declare_parameter("robot_ip", "192.168.1.10");
     this->declare_parameter("username", "admin");
     this->declare_parameter("password", "admin");
-    
+    this->declare_parameter("config_path", std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/kinova-gemini/config.yaml");
+
     string robot_ip = this->get_parameter("robot_ip").as_string();
     
     // --- Kortex API Setup ---
@@ -36,6 +39,11 @@ Controller::Controller() : Node("kinova_controller")
 
     mBase = new k_api::Base::BaseClient(mRouter);
     mBaseCyclic = new k_api::BaseCyclic::BaseCyclicClient(mRouter);
+
+    // Push config.yaml's static_obstacles into firmware Protection Zones on every
+    // startup, so editing the config and relaunching is enough to keep the arm's
+    // enforced no-go volumes in sync -- no separate setup script to remember to rerun.
+    configureProtectionZonesFromConfig();
 
     // --- Action Servers ---
     this->mActionPoseServer = rclcpp_action::create_server<ros2_interfaces::action::MoveToPose>(
@@ -62,14 +70,24 @@ Controller::Controller() : Node("kinova_controller")
         std::bind(&Controller::handle_grasp_cancel, this, _1),
         std::bind(&Controller::handle_grasp_accepted, this, _1));
 
-    // --- Services ---
-    mSrvComputeIK = this->create_service<ros2_interfaces::srv::ComputeIK>(
-        "compute_ik", std::bind(&Controller::computeIK, this, _1, _2));
-
     // --- Telemetry Pub ---
     mPubState = this->create_publisher<ros2_interfaces::msg::RobotState>("robot_state", 10);
     mPubJointState = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
     mTimer = this->create_wall_timer(std::chrono::milliseconds(50), std::bind(&Controller::publishState, this));
+
+    // Protection zones are firmware-side and invisible to any other ROS message.
+    // Read them back from the arm once (rather than reusing the config.yaml values
+    // we just pushed above) so the startup log line and RViz wireframe reflect what's
+    // actually enforced on hardware, catching e.g. a rejected/malformed zone.
+    // transient_local durability means a late-starting RViz still picks up this one
+    // publish, so there's no need to keep re-publishing/re-logging on a timer.
+    mPubProtectionZones = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "protection_zones", rclcpp::QoS(1).transient_local());
+    publishProtectionZones();
+
+    // Subscribe to the firmware's own real-time protection zone events, so a zone-triggered
+    // stop is reported directly rather than inferred from a stalled move.
+    subscribeToProtectionZoneEvents();
 
     RCLCPP_INFO(this->get_logger(), "Kinova Controller Initialized");
 }
@@ -161,9 +179,20 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
     pose->set_theta_y(wrap_angle(goal->theta_y, current_pose.theta_y()));
     pose->set_theta_z(wrap_angle(goal->theta_z, current_pose.theta_z()));
 
-    auto speed = reach_pose->mutable_constraint()->mutable_speed();
-    speed->set_translation(goal->speed_scaling > 0 ? goal->speed_scaling : 0.1f);
-    speed->set_orientation(20.0f);
+    // No speed constraint by default: the arm's Cartesian speed is configured in the Kinova
+    // Web App (the CARTESIAN_TRAJECTORY soft limits), and that is the only place to change it.
+    // A constraint here is a ceiling BELOW that, never a way to exceed it -- an earlier
+    // hard-coded one (0.1 m/s, 20 deg/s) is why Cartesian moves used to crawl while
+    // execute_joints, which sets no constraint, ran at full speed.
+    //
+    // speed_scaling > 0 opts into a slower move (both fields must be set: Speed carries them
+    // as a pair, so leaving orientation at 0 would command zero rotation speed). Kortex applies
+    // the two independently and the move takes the longer of the two times.
+    if (goal->speed_scaling > 0) {
+        auto speed = reach_pose->mutable_constraint()->mutable_speed();
+        speed->set_translation(goal->speed_scaling);
+        speed->set_orientation(20.0f);
+    }
 
     try {
         {
@@ -171,22 +200,20 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
             mBase->ExecuteAction(action);
         }
 
-        auto start_time = std::chrono::steady_clock::now();
+        RCLCPP_INFO(this->get_logger(), "Executing Cartesian target: (%.3f, %.3f, %.3f)%s",
+                    goal->x, goal->y, goal->z,
+                    goal->speed_scaling > 0 ? " [speed-limited]" : "");
+
+        // With no execution timeout, a move that never converges loops until it is cancelled --
+        // so log distance_to_go every ~2s (20 * 100ms) to make a stalled move visible in Terminal 1.
+        int log_counter = 0;
         while (rclcpp::ok()) {
             if (goal_handle->is_canceling()) {
                 std::lock_guard<std::mutex> lock(mApiMutex);
                 mBase->Stop();
                 result->success = false;
                 goal_handle->canceled(result);
-                return;
-            }
-
-            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(15)) {
-                RCLCPP_WARN(this->get_logger(), "Pose execution timed out after 15 seconds.");
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->Stop();
-                result->success = false;
-                goal_handle->succeed(result); // Return what we got
+                RCLCPP_WARN(this->get_logger(), "Cartesian move cancelled.");
                 return;
             }
 
@@ -200,8 +227,12 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
             feedback->distance_to_go = dist;
             goal_handle->publish_feedback(feedback);
             if (dist < 0.01) break;
+            if (++log_counter % 20 == 0) {
+                RCLCPP_INFO(this->get_logger(), "Pose execution polling: distance_to_go = %.3f m", dist);
+            }
             std::this_thread::sleep_for(100ms);
         }
+        RCLCPP_INFO(this->get_logger(), "Cartesian target reached.");
         result->success = true;
         goal_handle->succeed(result);
     } catch (k_api::KDetailedException& ex) {
@@ -218,242 +249,46 @@ void Controller::execute_joints(const std::shared_ptr<GoalHandleJoints> goal_han
     auto feedback = std::make_shared<ros2_interfaces::action::MoveToJoints::Feedback>();
 
     std::vector<double> target_joints;
-    bool is_trajectory = !goal->trajectory_points.empty();
 
-    if (is_trajectory) {
-        RCLCPP_INFO(this->get_logger(), "Executing cuRobo multi-point trajectory (%zu waypoints)...", goal->trajectory_points.size());
+    RCLCPP_INFO(this->get_logger(), "Executing single-point joint target...");
 
-        // --- Build the angular waypoint list ---
-        // For Kinova AngularWaypoints, set ONLY the per-waypoint duration. Do NOT mix in
-        // maximum_velocities or optimal blending: the firmware trajectory generator requires
-        // the first and last waypoints to be at rest, and an over-constrained list is rejected
-        // (INITIAL/FINAL_WAYPOINT_NO_STOP, INVALID_DURATION, INVALID_JOINT_SPEED).
-        k_api::Base::WaypointList waypoint_list;
-        waypoint_list.set_duration(0.0f);
-        waypoint_list.set_use_optimal_blending(false);
-
-        for (size_t i = 0; i < goal->trajectory_points.size(); ++i) {
-            const auto& pt = goal->trajectory_points[i];
-            if (pt.positions.size() < 7) {
-                RCLCPP_ERROR(this->get_logger(), "Waypoint %zu has invalid joint count: %zu (expected 7)", i, pt.positions.size());
-                result->success = false;
-                goal_handle->abort(result);
-                return;
-            }
-
-            auto wp = waypoint_list.add_waypoints();
-            wp->set_name("waypoint_" + std::to_string(i));
-
-            auto angular_wp = wp->mutable_angular_waypoint();
-            for (size_t j = 0; j < 7; ++j) {
-                // Convert radians (cuRobo / ROS standard) to degrees (Kortex standard)
-                angular_wp->add_angles(static_cast<float>(pt.positions[j] * 180.0 / M_PI));
-            }
-
-            // Per-segment duration. cuRobo populates time_from_start = i * interpolation_dt on
-            // every point, so for i>=1 we use the real planned dt and the executed motion
-            // tracks cuRobo's interpolated trajectory. Waypoint 0 is the start (current)
-            // config: its time_from_start is 0, so there is no previous delta - give it one
-            // interpolation step instead of letting the old heuristic stamp a 1.0s dwell that
-            // made every move begin with a 1-second pause.
-            float segment_duration = 0.0f;
-            double t_curr = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9;
-
-            if (i == 0) {
-                // Use the spacing to the next point (the nominal interpolation_dt) so the
-                // start is consistent with the rest of the trajectory; fall back to 0.05s if
-                // it's the only point.
-                double t_next = 0.05;
-                if (goal->trajectory_points.size() > 1) {
-                    const auto& next = goal->trajectory_points[1];
-                    double tn = next.time_from_start.sec + next.time_from_start.nanosec * 1e-9;
-                    if (tn > 1e-3) t_next = tn;
-                }
-                segment_duration = static_cast<float>(t_next);
-            } else {
-                const auto& prev = goal->trajectory_points[i-1];
-                double t_prev = prev.time_from_start.sec + prev.time_from_start.nanosec * 1e-9;
-                double dt = t_curr - t_prev;
-                if (dt > 1e-3) {
-                    segment_duration = static_cast<float>(dt);
-                } else {
-                    // cuRobo should always provide timing; reaching here means the
-                    // interpolation_dt handoff regressed. Warn (throttled) instead of
-                    // silently slowing the trajectory.
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                        "Waypoint %zu missing time_from_start delta; using ~20 deg/s fallback timing. "
-                        "Check cuRobo interpolation_dt handoff.", i);
-                    double max_delta_deg = 0.0;
-                    for (size_t j = 0; j < 7; ++j) {
-                        double prev_deg = goal->trajectory_points[i-1].positions[j] * 180.0 / M_PI;
-                        double curr_deg = pt.positions[j] * 180.0 / M_PI;
-                        max_delta_deg = std::max(max_delta_deg, std::abs(curr_deg - prev_deg));
-                    }
-                    segment_duration = std::max(0.05f, static_cast<float>(max_delta_deg / 20.0));
-                }
-            }
-            angular_wp->set_duration(segment_duration);
-        }
-
-        if (!goal->trajectory_points.empty()) {
-            const auto& last = goal->trajectory_points.back();
-            double total_s = last.time_from_start.sec + last.time_from_start.nanosec * 1e-9;
-            RCLCPP_INFO(this->get_logger(),
-                "Built %zu-waypoint trajectory, total planned duration %.2fs (cuRobo interpolation_dt timing).",
-                goal->trajectory_points.size(), total_s);
-        }
-
-        // --- Validate BEFORE executing: the robot silently refuses an invalid list ---
-        try {
-            k_api::Base::WaypointValidationReport report;
-            {
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                report = mBase->ValidateWaypointList(waypoint_list);
-            }
-            int err_count = report.trajectory_error_report().trajectory_error_elements_size();
-            if (err_count > 0) {
-                RCLCPP_ERROR(this->get_logger(), "Waypoint trajectory REJECTED by validator (%d errors):", err_count);
-                for (int e = 0; e < err_count; ++e) {
-                    const auto& el = report.trajectory_error_report().trajectory_error_elements(e);
-                    RCLCPP_ERROR(this->get_logger(), "  [wp %u] type=%d value=%.3f (min=%.3f max=%.3f): %s",
-                                 el.waypoint_index(), static_cast<int>(el.error_type()),
-                                 el.error_value(), el.min_value(), el.max_value(), el.message().c_str());
-                }
-                result->success = false;
-                goal_handle->abort(result);
-                return;
-            }
-        } catch (k_api::KDetailedException& ex) {
-            RCLCPP_ERROR(this->get_logger(), "Kortex error during waypoint validation: %s", ex.what());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        } catch (const std::exception& ex) {
-            // Kortex's generated RPC stubs (e.g. ValidateWaypointList's default 3000ms
-            // timeout) throw a bare std::runtime_error on timeout, not a KDetailedException.
-            // Uncaught, this would propagate out of execute_joints() - which runs in a
-            // detached std::thread - and call std::terminate(), killing the entire
-            // controller node over a single bad goal. Abort just this goal instead.
-            RCLCPP_ERROR(this->get_logger(), "Error during waypoint validation: %s", ex.what());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        }
-
-        // --- Execute and wait on the action notification (ACTION_END / ACTION_ABORT) ---
-        auto finished = std::make_shared<std::promise<k_api::Base::ActionEvent>>();
-        auto finished_future = finished->get_future();
-        auto event_cb = [finished](k_api::Base::ActionNotification notif) {
-            auto ev = notif.action_event();
-            if (ev == k_api::Base::ACTION_END || ev == k_api::Base::ACTION_ABORT) {
-                try { finished->set_value(ev); } catch (...) { /* already set */ }
-            }
-        };
-
-        k_api::Common::NotificationHandle notif_handle;
-        try {
-            std::lock_guard<std::mutex> lock(mApiMutex);
-            notif_handle = mBase->OnNotificationActionTopic(event_cb, k_api::Common::NotificationOptions());
-            mBase->ExecuteWaypointTrajectory(waypoint_list);
-        } catch (k_api::KDetailedException& ex) {
-            RCLCPP_ERROR(this->get_logger(), "Kortex Waypoint Error during execution: %s", ex.what());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        } catch (const std::exception& ex) {
-            // See the matching catch above ValidateWaypointList: a bare std::runtime_error
-            // (e.g. an RPC timeout) here would otherwise crash the whole node.
-            RCLCPP_ERROR(this->get_logger(), "Error during waypoint execution: %s", ex.what());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        }
-
-        auto traj_start = std::chrono::steady_clock::now();
-        bool got_event = false;
-        while (rclcpp::ok()) {
-            if (finished_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
-                got_event = true;
-                break;
-            }
-            if (goal_handle->is_canceling()) {
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->Stop();
-                mBase->Unsubscribe(notif_handle);
-                result->success = false;
-                goal_handle->canceled(result);
-                return;
-            }
-            if (std::chrono::steady_clock::now() - traj_start > std::chrono::seconds(60)) {
-                RCLCPP_WARN(this->get_logger(), "Waypoint trajectory timed out after 60 seconds.");
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->Stop();
-                mBase->Unsubscribe(notif_handle);
-                result->success = false;
-                goal_handle->abort(result);
-                return;
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mApiMutex);
-            mBase->Unsubscribe(notif_handle);
-        }
-
-        auto event = got_event ? finished_future.get() : k_api::Base::ACTION_ABORT;
-        if (event == k_api::Base::ACTION_END) {
-            RCLCPP_INFO(this->get_logger(), "Waypoint trajectory completed.");
-            result->success = true;
-            goal_handle->succeed(result);
-        } else {
-            RCLCPP_ERROR(this->get_logger(), "Waypoint trajectory aborted by robot (ACTION_ABORT).");
-            result->success = false;
-            goal_handle->abort(result);
-        }
+    if (goal->joint_angles.size() < 7) {
+        RCLCPP_ERROR(this->get_logger(), "Joint target has invalid joint count: %zu (expected 7)", goal->joint_angles.size());
+        result->success = false;
+        goal_handle->abort(result);
         return;
-
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Executing single-point joint target (legacy mode)...");
-        
-        if (goal->joint_angles.size() < 7) {
-            RCLCPP_ERROR(this->get_logger(), "Joint target has invalid joint count: %zu (expected 7)", goal->joint_angles.size());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        }
-
-        k_api::Base::Action action;
-        action.set_name("Joint Move");
-        auto reach_joints = action.mutable_reach_joint_angles();
-        auto joints = reach_joints->mutable_joint_angles();
-
-        for (size_t i = 0; i < 7; ++i) {
-            auto j = joints->add_joint_angles();
-            j->set_joint_identifier(i);
-            j->set_value(static_cast<float>(goal->joint_angles[i]));
-        }
-
-        // Target joints are in degrees directly
-        target_joints.resize(7);
-        for (size_t j = 0; j < 7; ++j) {
-            target_joints[j] = goal->joint_angles[j];
-        }
-
-        try {
-            {
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->ExecuteAction(action);
-            }
-        } catch (k_api::KDetailedException& ex) {
-            RCLCPP_ERROR(this->get_logger(), "Kortex Error: %s", ex.what());
-            result->success = false;
-            goal_handle->abort(result);
-            return;
-        }
     }
 
-    // Polling / completion check loop (identical for both modes)
-    auto start_time = std::chrono::steady_clock::now();
+    k_api::Base::Action action;
+    action.set_name("Joint Move");
+    auto reach_joints = action.mutable_reach_joint_angles();
+    auto joints = reach_joints->mutable_joint_angles();
+
+    for (size_t i = 0; i < 7; ++i) {
+        auto j = joints->add_joint_angles();
+        j->set_joint_identifier(i);
+        j->set_value(static_cast<float>(goal->joint_angles[i]));
+    }
+
+    // Target joints are in degrees directly
+    target_joints.resize(7);
+    for (size_t j = 0; j < 7; ++j) {
+        target_joints[j] = goal->joint_angles[j];
+    }
+
+    try {
+        {
+            std::lock_guard<std::mutex> lock(mApiMutex);
+            mBase->ExecuteAction(action);
+        }
+    } catch (k_api::KDetailedException& ex) {
+        RCLCPP_ERROR(this->get_logger(), "Kortex Error: %s", ex.what());
+        result->success = false;
+        goal_handle->abort(result);
+        return;
+    }
+
+    // Polling / completion check loop
     int log_counter = 0;
     try {
         while (rclcpp::ok()) {
@@ -462,16 +297,6 @@ void Controller::execute_joints(const std::shared_ptr<GoalHandleJoints> goal_han
                 mBase->Stop();
                 result->success = false;
                 goal_handle->canceled(result);
-                return;
-            }
-
-            // Implement a 10-second safety timeout to prevent infinite hanging when goals are rejected or unreachable
-            if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
-                RCLCPP_WARN(this->get_logger(), "Joint execution timed out after 10 seconds.");
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->Stop();
-                result->success = false;
-                goal_handle->succeed(result); // Return progress made
                 return;
             }
             
@@ -541,44 +366,6 @@ void Controller::execute_grasp(const std::shared_ptr<GoalHandleGripper> goal_han
     execute_gripper(goal_handle);
 }
 
-void Controller::computeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
-                           std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response)
-{
-    std::lock_guard<std::mutex> lock(mApiMutex);
-    try {
-        k_api::Base::IKData ik_data;
-        
-        // 1. Set the target Cartesian pose
-        auto cartesian_pose = ik_data.mutable_cartesian_pose();
-        cartesian_pose->set_x(static_cast<float>(request->x));
-        cartesian_pose->set_y(static_cast<float>(request->y));
-        cartesian_pose->set_z(static_cast<float>(request->z));
-        cartesian_pose->set_theta_x(static_cast<float>(request->theta_x));
-        cartesian_pose->set_theta_y(static_cast<float>(request->theta_y));
-        cartesian_pose->set_theta_z(static_cast<float>(request->theta_z));
-
-        // 2. Use current joint angles as the SEED for IK to find the closest solution
-        auto current_joints = mBase->GetMeasuredJointAngles();
-        ik_data.mutable_guess()->CopyFrom(current_joints);
-
-        // 3. Compute IK
-        auto computed_joints = mBase->ComputeInverseKinematics(ik_data);
-        
-        for (auto j : computed_joints.joint_angles()) {
-            response->joint_angles.push_back(j.value());
-        }
-        response->success = true;
-        response->message = "IK Successful";
-        
-    } catch (k_api::KDetailedException& ex) {
-        response->success = false;
-        response->message = "Kortex IK Error: " + std::string(ex.what());
-    } catch (const std::exception& ex) {
-        response->success = false;
-        response->message = "Error: " + std::string(ex.what());
-    }
-}
-
 void Controller::publishState()
 {
     std::lock_guard<std::mutex> lock(mApiMutex);
@@ -608,6 +395,180 @@ void Controller::publishState()
 
         mPubJointState->publish(jmsg);
     } catch (...) {}
+}
+
+void Controller::configureProtectionZonesFromConfig()
+{
+    std::string config_path = this->get_parameter("config_path").as_string();
+
+    YAML::Node config;
+    try {
+        config = YAML::LoadFile(config_path);
+    } catch (const std::exception& ex) {
+        RCLCPP_WARN(this->get_logger(), "Could not load '%s' for protection zones: %s", config_path.c_str(), ex.what());
+        return;
+    }
+
+    YAML::Node obstacles = config["static_obstacles"];
+    if (!obstacles || obstacles.size() == 0) {
+        RCLCPP_INFO(this->get_logger(), "No 'static_obstacles' in config.yaml -- skipping protection zone setup.");
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mApiMutex);
+    try {
+        // Delete any existing zone whose name we're about to (re)create, so simply
+        // editing config.yaml and relaunching can't accumulate duplicate/stale zones.
+        auto existing = mBase->ReadAllProtectionZones();
+        for (const auto& zone : existing.protection_zones()) {
+            if (obstacles[zone.name()]) {
+                mBase->DeleteProtectionZone(zone.handle());
+                RCLCPP_INFO(this->get_logger(), "Deleted existing protection zone '%s' before recreating it.", zone.name().c_str());
+            }
+        }
+
+        for (const auto& kv : obstacles) {
+            std::string name = kv.first.as<std::string>();
+            auto center = kv.second["center"].as<std::vector<double>>();
+            auto size = kv.second["size"].as<std::vector<double>>();
+            if (center.size() != 3 || size.size() != 3) {
+                RCLCPP_WARN(this->get_logger(), "Protection zone '%s' has malformed center/size in config.yaml -- skipping.", name.c_str());
+                continue;
+            }
+
+            k_api::Base::ProtectionZone zone;
+            zone.set_name(name);
+            zone.set_is_enabled(true);
+
+            auto* shape = zone.mutable_shape();
+            shape->set_shape_type(k_api::Base::RECTANGULAR_PRISM);
+            shape->mutable_origin()->set_x(center[0]);
+            shape->mutable_origin()->set_y(center[1]);
+            shape->mutable_origin()->set_z(center[2]);
+            shape->add_dimensions(size[0]);
+            shape->add_dimensions(size[1]);
+            shape->add_dimensions(size[2]);
+
+            // Identity orientation -- our boxes are axis-aligned with base_link
+            auto* orientation = shape->mutable_orientation();
+            orientation->mutable_row1()->set_column1(1.0);
+            orientation->mutable_row2()->set_column2(1.0);
+            orientation->mutable_row3()->set_column3(1.0);
+
+            auto handle = mBase->CreateProtectionZone(zone);
+            RCLCPP_INFO(this->get_logger(),
+                "Configured protection zone '%s' (handle=%u): center=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f)",
+                name.c_str(), handle.identifier(), center[0], center[1], center[2], size[0], size[1], size[2]);
+        }
+    } catch (const std::exception& ex) {
+        RCLCPP_WARN(this->get_logger(), "Failed to configure protection zones on firmware: %s", ex.what());
+    }
+}
+
+void Controller::publishProtectionZones()
+{
+    k_api::Base::ProtectionZoneList zone_list;
+    try {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        zone_list = mBase->ReadAllProtectionZones();
+    } catch (const std::exception& ex) {
+        RCLCPP_WARN(this->get_logger(), "Failed to read protection zones from firmware: %s", ex.what());
+        return;
+    }
+
+    visualization_msgs::msg::MarkerArray marker_array;
+    int id = 0;
+    for (const auto& zone : zone_list.protection_zones()) {
+        const auto& shape = zone.shape();
+        if (shape.dimensions_size() < 3) continue;
+
+        double cx = shape.origin().x(), cy = shape.origin().y(), cz = shape.origin().z();
+        double dx = shape.dimensions(0), dy = shape.dimensions(1), dz = shape.dimensions(2);
+
+        RCLCPP_INFO(this->get_logger(),
+            "Protection zone '%s': origin=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f) enabled=%s",
+            zone.name().c_str(), cx, cy, cz, dx, dy, dz, zone.is_enabled() ? "true" : "false");
+
+        if (zone.has_handle()) {
+            mZoneNamesByHandle[zone.handle().identifier()] = zone.name();
+        }
+
+        // Assumes axis-aligned zones (identity orientation), matching how
+        // configureProtectionZonesFromConfig() creates them.
+        double hx = dx / 2.0, hy = dy / 2.0, hz = dz / 2.0;
+        geometry_msgs::msg::Point corners[8];
+        double signs[8][3] = {
+            {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+            {-1,-1, 1}, {1,-1, 1}, {1,1, 1}, {-1,1, 1},
+        };
+        for (int i = 0; i < 8; ++i) {
+            corners[i].x = cx + signs[i][0] * hx;
+            corners[i].y = cy + signs[i][1] * hy;
+            corners[i].z = cz + signs[i][2] * hz;
+        }
+        static const int edges[12][2] = {
+            {0,1},{1,2},{2,3},{3,0}, {4,5},{5,6},{6,7},{7,4}, {0,4},{1,5},{2,6},{3,7}
+        };
+
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "base_link";
+        marker.header.stamp = this->now();
+        marker.ns = "protection_zones";
+        marker.id = id++;
+        marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.004; // line width in meters
+        marker.color.r = 1.0f; marker.color.g = 0.2f; marker.color.b = 0.0f;
+        marker.color.a = zone.is_enabled() ? 0.9f : 0.25f;
+        for (const auto& e : edges) {
+            marker.points.push_back(corners[e[0]]);
+            marker.points.push_back(corners[e[1]]);
+        }
+        marker_array.markers.push_back(marker);
+    }
+
+    mPubProtectionZones->publish(marker_array);
+}
+
+void Controller::subscribeToProtectionZoneEvents()
+{
+    try {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        mProtectionZoneNotifHandle = mBase->OnNotificationProtectionZoneTopic(
+            std::bind(&Controller::onProtectionZoneNotification, this, _1),
+            k_api::Common::NotificationOptions());
+    } catch (const std::exception& ex) {
+        RCLCPP_WARN(this->get_logger(), "Failed to subscribe to protection zone notifications: %s", ex.what());
+    }
+}
+
+// Called from a Kortex-internal notification thread, not the rclcpp executor thread.
+// mZoneNamesByHandle is only ever written during startup (before this subscription
+// exists), so reading it here without a lock is safe.
+void Controller::onProtectionZoneNotification(k_api::Base::ProtectionZoneNotification notification)
+{
+    std::string name = "<unknown>";
+    if (notification.has_handle()) {
+        auto it = mZoneNamesByHandle.find(notification.handle().identifier());
+        if (it != mZoneNamesByHandle.end()) name = it->second;
+    }
+
+    switch (notification.event()) {
+        case k_api::Base::REACHED:
+            RCLCPP_WARN(this->get_logger(),
+                "Protection zone '%s' REACHED -- the arm is at the zone boundary and will not move further into it.",
+                name.c_str());
+            break;
+        case k_api::Base::ENTERED:
+            RCLCPP_WARN(this->get_logger(), "Protection zone '%s' ENTERED.", name.c_str());
+            break;
+        case k_api::Base::EXITED:
+            RCLCPP_INFO(this->get_logger(), "Protection zone '%s' EXITED.", name.c_str());
+            break;
+        default:
+            break;
+    }
 }
 
 int main(int argc, char** argv) {

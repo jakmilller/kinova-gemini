@@ -1,6 +1,5 @@
 # Goal
-float64[] joint_angles                                   # Single target (legacy support)
-trajectory_msgs/JointTrajectoryPoint[] trajectory_points # Sequence of joint angles for cuRobo trajectories (new)
+float64[] joint_angles # Target joint angles, degrees
 ---
 # Result
 bool success

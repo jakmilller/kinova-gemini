@@ -1,6 +1,11 @@
 from google.genai import types
 
-# --- Inspection Tools ---
+# v2 tool set — a small, orthogonal collection. Each tool does exactly one thing:
+# perception, an absolute move, a relative move, an autonomous grasp, or a gripper/joint action.
+# There is no multi-mode grasp and no coordinate-grasp tool: the model composes a manual pick
+# from move_to_position + close_gripper, and uses grasp_object only for the AnyGrasp path.
+
+# --- Perception ---
 
 inspect_scene_tool = types.FunctionDeclaration(
     name="inspect_scene",
@@ -8,7 +13,8 @@ inspect_scene_tool = types.FunctionDeclaration(
         "Uses an intelligent robotics model to perform an in-depth analysis of the scene. "
         "It identifies all items, provides their semantic descriptions, and determines their 3D poses "
         "relative to the robot base. Optionally, also identifies a specific spatial region described "
-        "in natural language (e.g. a chess square, a compartment of a box, a spot relative to other objects)."
+        "in natural language (e.g. a chess square, a compartment of a box, a spot relative to other objects). "
+        "Does NOT move the robot."
     ),
     parameters=types.Schema(
         type="OBJECT",
@@ -27,106 +33,171 @@ inspect_scene_tool = types.FunctionDeclaration(
     )
 )
 
-# --- Low-level Tools ---
+# --- Motion ---
+
+move_to_position_tool = types.FunctionDeclaration(
+    name="move_to_position",
+    description=(
+        "Moves the gripper to the specified absolute Cartesian position, keeping the current wrist "
+        "orientation. Works the same whether the gripper is empty or holding a grasped object — use it "
+        "to carry an object to its destination. Coordinates are in meters relative to the robot base "
+        "(+X forward, +Y left, +Z up). Ground the coordinates in object positions from inspect_scene."
+    ),
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "x": types.Schema(type="NUMBER", description="Target x coordinate in meters (base frame)."),
+            "y": types.Schema(type="NUMBER", description="Target y coordinate in meters (base frame)."),
+            "z": types.Schema(type="NUMBER", description="Target z coordinate in meters (base frame)."),
+        },
+        required=["x", "y", "z"],
+    )
+)
+
+move_relative_tool = types.FunctionDeclaration(
+    name="move_relative",
+    description=(
+        "Moves the gripper by a relative offset from its current position, keeping the current wrist "
+        "orientation. Offsets are in meters along the robot base axes: +X forward, +Y left, +Z up. "
+        "Use this for incremental adjustments where you do not have (or do not need) absolute "
+        "coordinates — e.g. 'move up 2 cm' is dz=0.02, 'back off 5 cm' is dx=-0.05. Any unspecified "
+        "offset defaults to 0."
+    ),
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "dx": types.Schema(type="NUMBER", description="Relative offset along base +X (forward) in meters. Default 0."),
+            "dy": types.Schema(type="NUMBER", description="Relative offset along base +Y (left) in meters. Default 0."),
+            "dz": types.Schema(type="NUMBER", description="Relative offset along base +Z (up) in meters. Default 0."),
+        },
+    )
+)
+
+adjust_joints_tool = types.FunctionDeclaration(
+    name="adjust_joints",
+    description=(
+        "Adjusts a single joint by a relative amount in degrees. Most useful for joint 7 (the wrist roll) "
+        "to spin the gripper or a held object, or to line the fingers up across a long/narrow object "
+        "before a manual grasp."
+    ),
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "joint": types.Schema(type="NUMBER", description="The joint number to adjust (1-7)."),
+            "amount": types.Schema(type="NUMBER", description="Relative adjustment in degrees."),
+        },
+        required=["joint", "amount"],
+    )
+)
 
 move_to_home_tool = types.FunctionDeclaration(
     name="move_to_home",
-    description="Moves the robot arm to pre-defined home position. From the home position, the robot's gripper is looking down at objects on the table.",
-    parameters=types.Schema(
-        type="OBJECT",
-        properties={},
-    )
+    description="Moves the robot arm to the pre-defined home position, where the gripper looks down at objects on the table.",
+    parameters=types.Schema(type="OBJECT", properties={}),
 )
 
 move_to_user_tool = types.FunctionDeclaration(
     name="move_to_user",
-    description="Moves the robot arm to a pre-defined position near the user. From the user position, the robot is looking horizontally at the user.",
+    description="Moves the robot arm to a pre-defined position near the user, where the gripper faces the user horizontally.",
+    parameters=types.Schema(type="OBJECT", properties={}),
+)
+
+stop_robot_tool = types.FunctionDeclaration(
+    name="stop_robot",
+    description="Immediately stops the robot from moving. Call this if the user changes their mind mid-task.",
+    parameters=types.Schema(type="OBJECT", properties={}),
+)
+
+# --- Grasp ---
+
+grasp_simple_object_tool = types.FunctionDeclaration(
+    name="grasp_simple_object",
+    description=(
+        "Picks up an object at a known position with a single call. It pre-shapes the gripper to the "
+        "object's width, moves the gripper to the object's coordinates keeping the current (top-down) "
+        "orientation, and closes until contact. Use this for ordinary top-down picks. You MUST call "
+        "inspect_scene first to get the object's x/y/z position and width. After it succeeds the gripper "
+        "is closed around the object; use move_to_position to carry it and adjust_gripper(open) to release. "
+        "For objects with handles, rims, or complex shapes that need a side/angled grasp, use "
+        "grasp_complex_object instead."
+    ),
     parameters=types.Schema(
         type="OBJECT",
-        properties={},
+        properties={
+            "x": types.Schema(type="NUMBER", description="Object x coordinate in meters (base frame), from inspect_scene."),
+            "y": types.Schema(type="NUMBER", description="Object y coordinate in meters (base frame), from inspect_scene."),
+            "z": types.Schema(type="NUMBER", description="Object z coordinate in meters (base frame), from inspect_scene."),
+            "width": types.Schema(
+                type="NUMBER",
+                description="OPTIONAL. The object's estimated width in meters (from inspect_scene). The gripper "
+                            "pre-shapes to this before approaching, reducing the chance of bumping neighbors. "
+                            "Omit only if no width estimate is available.",
+            ),
+        },
+        required=["x", "y", "z"],
     )
 )
 
-grasp_object_tool = types.FunctionDeclaration(
-    name="grasp_object",
+grasp_complex_object_tool = types.FunctionDeclaration(
+    name="grasp_complex_object",
     description=(
-        "Executes a complete pick sequence on a target object: pre-shapes the gripper, "
-        "moves to a pre-grasp position, approaches the grasp pose, and closes the gripper until contact. "
-        "Two mutually exclusive modes — provide exactly one:\n"
-        "  • object_label: autonomously determines the best 6D grasp pose using AnyGrasp vision (preferred "
-        "for objects with handles, rims, or complex geometry).\n"
-        "  • x/y/z: approaches the given TCP contact-point coordinates using the arm's current orientation "
-        "(suitable for simple flat objects when you already know the position from inspect_scene).\n"
-        "After this tool succeeds the gripper is closed around the object. Use move_to_position to carry "
-        "it somewhere, then open_gripper to release."
+        "Autonomously picks up a named object using AnyGrasp vision: it finds the best 6D grasp pose and "
+        "approach angle on its own, moves directly to that pose, and closes the gripper. This is the mode "
+        "that can grasp from the side or at an angle — use it for objects with handles, rims, or complex "
+        "geometry. For a simple top-down pick, use grasp_simple_object instead. After this succeeds the "
+        "gripper is closed around the object; use move_to_position to carry it and adjust_gripper(open) to release."
     ),
     parameters=types.Schema(
         type="OBJECT",
         properties={
             "object_label": types.Schema(
                 type="STRING",
-                description="Semantic label of the target object (e.g. 'red cup', 'bottle handle'). Use this mode for complex objects — AnyGrasp will find the best 6D grasp pose autonomously.",
+                description="Semantic label of the target object (e.g. 'coffee mug', 'jug handle').",
             ),
-            "x": types.Schema(type="NUMBER", description="TCP contact-point x coordinate in meters (base frame). Use with y and z when you already know the object position from inspect_scene."),
-            "y": types.Schema(type="NUMBER", description="TCP contact-point y coordinate in meters (base frame)."),
-            "z": types.Schema(type="NUMBER", description="TCP contact-point z coordinate in meters (base frame)."),
         },
+        required=["object_label"],
     )
 )
 
-open_gripper_tool = types.FunctionDeclaration(
-    name="open_gripper",
-    description="Opens the gripper fully, releasing any held object.",
-    parameters=types.Schema(
-        type="OBJECT",
-        properties={},
-    )
-)
+# --- Gripper ---
 
-move_to_position_tool = types.FunctionDeclaration(
-    name="move_to_position",
+adjust_gripper_tool = types.FunctionDeclaration(
+    name="adjust_gripper",
     description=(
-        "Moves the gripper TCP to the specified Cartesian position, keeping the current wrist orientation. "
-        "Works the same whether the gripper is empty or holding a grasped object — use this to carry an "
-        "object to its destination after grasp_object. "
-        "Arguments are absolute coordinates in meters relative to the robot base."
+        "Controls the gripper. Pass action='open' to open fully and release any held object; "
+        "action='close' to close the gripper); or action='custom' with a width in "
+        "meters to set a specific opening (e.g. to pre-shape before sliding between two items). "
+        "For an ordinary pick you do not need this — grasp_simple_object and grasp_complex_object handle "
+        "their own gripper shaping and closing."
     ),
     parameters=types.Schema(
         type="OBJECT",
         properties={
-            "x": types.Schema(type="NUMBER", description="Target x coordinate in meters"),
-            "y": types.Schema(type="NUMBER", description="Target y coordinate in meters"),
-            "z": types.Schema(type="NUMBER", description="Target z coordinate in meters"),
+            "action": types.Schema(
+                type="STRING",
+                enum=["open", "close", "custom"],
+                description="'open' = fully open, 'close' = close until contact, 'custom' = open to a specific width.",
+            ),
+            "width": types.Schema(
+                type="NUMBER",
+                description="REQUIRED only when action='custom': the desired opening width in meters (e.g. 0.05 for 5 cm).",
+            ),
         },
-        required=["x", "y", "z"]
+        required=["action"],
     )
 )
 
-adjust_joints_tool = types.FunctionDeclaration(
-    name="adjust_joints",
-    description="Call when user requests adjustment to the current joint position (e.g., 'rotate last joint 30 degrees'). Arguments are relative adjustments in degrees to current joint angles.",
-    parameters=types.Schema(
-        type="OBJECT",
-        properties={
-            "joint number": types.Schema(type="NUMBER", description="The joint number to adjust (1-7)."),
-            "amount": types.Schema(type="NUMBER", description="adjustment in degrees"),
-        },
-        required=["joint number", "amount"]
-    )
-)
+# --- Tool Collection ---
 
-stop_robot_tool = types.FunctionDeclaration(
-    name="stop_robot",
-    description="Immediately stops the robot from moving.",
-    parameters=types.Schema(
-        type="OBJECT",
-        properties={},
-    )
-)
-
-# --- Tool Collections ---
-
-INSPECTION_TOOLS = [inspect_scene_tool]
-LOW_LEVEL_TOOLS = [move_to_home_tool, move_to_user_tool, grasp_object_tool, open_gripper_tool, move_to_position_tool, adjust_joints_tool, stop_robot_tool]
-
-ALL_TOOLS = INSPECTION_TOOLS + LOW_LEVEL_TOOLS
+ALL_TOOLS = [
+    inspect_scene_tool,
+    move_to_position_tool,
+    move_relative_tool,
+    grasp_simple_object_tool,
+    grasp_complex_object_tool,
+    adjust_gripper_tool,
+    adjust_joints_tool,
+    move_to_home_tool,
+    move_to_user_tool,
+    stop_robot_tool,
+]

@@ -1,4 +1,10 @@
 #!/home/mcrr-lab/anaconda3/envs/kinova-gemini/bin/python3
+"""Gemini-Live Brain Node.
+
+The central async reasoning loop: connects to Gemini Live, streams camera frames to the model, plays back the model's audio
+replies, and calls tools to move the robot. It serves to orchestrate all of the robot behavior.
+See gemini_live_tools.py for in-depth description of available tools.
+"""
 
 import rclpy
 from rclpy.node import Node
@@ -13,7 +19,6 @@ import os
 import yaml
 import sys
 import json
-import re
 import cv2
 import time
 import base64
@@ -26,16 +31,20 @@ import argparse
 import asyncio
 import threading
 import pyaudio
-from PIL import Image as PILImage, ImageDraw, ImageFont
-from scipy.spatial.transform import Rotation as R
+from PIL import Image as PILImage, ImageDraw
 from dotenv import load_dotenv
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from .robot_controller_ros2 import KinovaRobotControllerROS2
 from .gemini_live_tools import ALL_TOOLS
-from . import vision_utils
+from . import perception
+from . import grasp
 
 WORKSPACE_PATH = os.path.expanduser('~/kinova-gemini')
+
+# Gemini Live returns audio replies as 24kHz mono PCM. (Mic input is handled by the
+# separate voice_interface_node, not here — this node never opens an input stream.)
+SPEAKER_RATE = 24000
 
 # Optional model dependencies
 sys.path.append(os.path.join(WORKSPACE_PATH, 'anygrasp_sdk'))
@@ -60,22 +69,6 @@ def _ts():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
-def _transform_to_matrix(t_msg):
-    mat = np.eye(4)
-    q = [t_msg.transform.rotation.x, t_msg.transform.rotation.y,
-         t_msg.transform.rotation.z, t_msg.transform.rotation.w]
-    mat[:3, :3] = R.from_quat(q).as_matrix()
-    mat[:3,  3] = [t_msg.transform.translation.x,
-                   t_msg.transform.translation.y,
-                   t_msg.transform.translation.z]
-    return mat
-
-
-def _angular_dist(R1, R2):
-    trace = np.trace(R1.T @ R2)
-    return np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
-
-
 class GeminiLiveBrainNode(Node):
     def __init__(self):
         super().__init__('gemini_live_brain_node')
@@ -96,20 +89,23 @@ class GeminiLiveBrainNode(Node):
 
         # Tool dispatch table — name → async handler returning (success, detail_string).
         self._tool_handlers = {
-            "move_to_home":     self._handle_move_to_home,
-            "stop_robot":       self._handle_stop_robot,
-            "move_to_user":     self._handle_move_to_user,
-            "grasp_object":     self._handle_grasp_object,
-            "open_gripper":     self._handle_open_gripper,
-            "move_to_position": self._handle_move_to_position,
-            "adjust_joints":    self._handle_adjust_joints,
-            "inspect_scene":    self._handle_inspect_scene,
+            "inspect_scene":        self._handle_inspect_scene,
+            "move_to_position":     self._handle_move_to_position,
+            "move_relative":        self._handle_move_relative,
+            "grasp_simple_object":  self._handle_grasp_simple_object,
+            "grasp_complex_object": self._handle_grasp_complex_object,
+            "adjust_gripper":       self._handle_adjust_gripper,
+            "adjust_joints":        self._handle_adjust_joints,
+            "move_to_home":         self._handle_move_to_home,
+            "move_to_user":         self._handle_move_to_user,
+            "stop_robot":           self._handle_stop_robot,
         }
         # Handlers in this set publish their own chat output (e.g. with an image),
         # so the dispatcher skips the generic "Tool Result" chat message.
         self._handlers_owning_chat = {"inspect_scene"}
 
-        self.get_logger().info('Gemini Live Brain Node initialized.')
+        self.get_logger().info('Gemini Live Brain Node initialized. Tools: '
+                               + ', '.join(self._tool_handlers.keys()))
 
     # ---- Initialization ----
 
@@ -149,7 +145,6 @@ class GeminiLiveBrainNode(Node):
         self.latest_camera_info = None
         self.current_robot_state = None
         self.transcription_buffer = ""
-        self.is_moving = False
 
         # Asyncio state — populated when run_live_session starts
         self.loop = None
@@ -171,6 +166,7 @@ class GeminiLiveBrainNode(Node):
                                  self.camera_info_callback, 10, callback_group=self.reentrant_group)
         self.create_subscription(RobotState, 'robot_state',
                                  self.state_callback, 10, callback_group=self.reentrant_group)
+        # Transcribed voice commands and typed commands arrive on the same topic 
         self.create_subscription(String, '/user_instructions',
                                  self.instruction_callback, 10, callback_group=self.reentrant_group)
 
@@ -194,9 +190,6 @@ class GeminiLiveBrainNode(Node):
         self.latest_camera_info = msg
 
     def state_callback(self, msg):
-        if self.current_robot_state is not None:
-            diff = np.abs(np.array(msg.joint_angles) - np.array(self.current_robot_state.joint_angles))
-            self.is_moving = bool(np.any(diff > 0.05))
         self.current_robot_state = msg
 
     def instruction_callback(self, msg):
@@ -210,8 +203,10 @@ class GeminiLiveBrainNode(Node):
 
     # ---- UI helpers ----
 
-    def publish_chat_message(self, role, text, image=None):
+    def publish_chat_message(self, role, text, image=None, source=None):
         msg_data = {"role": role, "text": text, "timestamp": time.time()}
+        if source is not None:
+            msg_data["source"] = source
         if image is not None:
             # JPEG-encode at quality 60 to keep rosbridge messages under the WebSocket size cap
             buffered = BytesIO()
@@ -220,7 +215,7 @@ class GeminiLiveBrainNode(Node):
             msg_data["image"] = f"data:image/jpeg;base64,{img_str}"
         self.chat_pub.publish(String(data=json.dumps(msg_data)))
 
-    # ---- Sensor / vision helpers ----
+    # ---- Sensor helpers ----
 
     async def _wait_for_frames(self, need_camera_info=False, need_state=False, attempts=10):
         """Wait up to attempts*0.5s for fresh sensor data. Returns True if all required data is present."""
@@ -236,190 +231,97 @@ class GeminiLiveBrainNode(Node):
             await asyncio.sleep(0.5)
         return False
 
-    async def _query_gemini_json(self, prompt, pil_image):
-        """Run a synchronous Gemini vision call in a worker thread so the event loop keeps moving.
-        Falls back to a salvage parser when Gemini emits malformed JSON (it does, sometimes).
-        """
-        def _call():
-            return self.client.models.generate_content(
-                model=self.flash_model_id,
-                contents=[pil_image, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", temperature=0.0,
-                ),
-            )
-        response = await asyncio.to_thread(_call)
-        self.get_logger().info(f"Vision response: {response.text}")
-        try:
-            return json.loads(response.text)
-        except json.JSONDecodeError as e:
-            self.get_logger().warn(f"Gemini returned invalid JSON ({e}); salvaging items via regex.")
-            return self._salvage_json_objects(response.text)
-
-    @staticmethod
-    def _salvage_json_objects(text):
-        """Pull individual {...} objects out of possibly-malformed JSON.
-        Tries strict parse per chunk first; if that fails, extracts box + last-quoted-string as label.
-        """
-        items = []
-        for match in re.finditer(r'\{[^{}]*\}', text):
-            chunk = match.group(0)
-            try:
-                items.append(json.loads(chunk))
-                continue
-            except json.JSONDecodeError:
-                pass
-            # Field-level extraction as a last resort
-            box_match = re.search(r'"box(?:_2d)?"\s*:\s*\[([^\]]+)\]', chunk)
-            if not box_match:
-                continue
-            try:
-                box = [int(float(x.strip())) for x in box_match.group(1).split(',')]
-            except ValueError:
-                continue
-            if len(box) != 4:
-                continue
-            # Last quoted string in the chunk is reliably the semantic name,
-            # even when the model emits malformed pairs like `"label": "item name": "cup"`.
-            labels = re.findall(r'"([^"]+)"', chunk)
-            label = labels[-1] if labels else 'object'
-            items.append({'box_2d': box, 'label': label})
-        return items
-
-    @staticmethod
-    def _normalize_box_label(item):
-        """Return (box, label) from one Gemini-shaped dict, tolerating common key variants.
-        Returns (None, None) if no usable box is present.
-        """
-        if not isinstance(item, dict):
-            return None, None
-        box = item.get('box_2d') or item.get('box')
-        label = (item.get('label') or item.get('item name') or item.get('part name')
-                 or item.get('item_name') or item.get('part_name') or 'object')
-        if isinstance(box, list) and len(box) == 4:
-            return box, label
-        return None, None
-
-    @classmethod
-    def _iter_box_label_pairs(cls, value):
-        """Yield (box_2d, label) pairs out of any reasonable Gemini response shape:
-        bare list, single dict, dict-wrapped list, list of dicts, etc.
-        """
-        if isinstance(value, list):
-            for item in value:
-                yield from cls._iter_box_label_pairs(item)
-        elif isinstance(value, dict):
-            box, label = cls._normalize_box_label(value)
-            if box is not None:
-                yield box, label
-            else:
-                for v in value.values():
-                    if isinstance(v, (list, dict)):
-                        yield from cls._iter_box_label_pairs(v)
-
-    async def _run_sam2(self, rgb_image, box):
-        """Box-prompt SAM2 to refine a Gemini bounding box into a binary mask.
-        rgb_image: HxWx3 RGB; box: (xmin, ymin, xmax, ymax). Returns HxW bool mask, or None if SAM2 missing.
-        """
-        if not self.sam_predictor:
-            return None
-        h, w = rgb_image.shape[:2]
-        xmin, ymin, xmax, ymax = box
-
-        def _predict():
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                self.sam_predictor.set_image(rgb_image)
-                masks, _, _ = self.sam_predictor.predict(
-                    box=np.array([xmin, ymin, xmax, ymax]),
-                    multimask_output=False,
-                )
-            return masks
-
-        masks = await asyncio.to_thread(_predict)
-        mask = masks[0].cpu().numpy() > 0 if torch.is_tensor(masks) else masks[0] > 0
-
-        # Clip the mask to inside its own bounding box (SAM2 sometimes spills slightly)
-        box_mask = np.zeros((h, w), dtype=bool)
-        box_mask[max(0, ymin):min(h, ymax), max(0, xmin):min(w, xmax)] = True
-        mask = mask & box_mask
-
-        torch.set_default_dtype(torch.float32)
-        torch.cuda.empty_cache()
-        return mask
-
-    @staticmethod
-    def _mask_centroid(mask, fallback_box):
-        M = cv2.moments(mask.astype(np.uint8))
-        if M["m00"] != 0:
-            return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-        xmin, ymin, xmax, ymax = fallback_box
-        return int((xmin + xmax) / 2), int((ymin + ymax) / 2)
-
-    @staticmethod
-    def _load_annotation_font(size=18):
-        for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                     "DejaVuSans-Bold.ttf"):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
     # ---- Tool handlers (one method per tool) ----
 
     async def _handle_move_to_home(self, args):
         ok = await self.controller.move_to_home()
         return ok, "Robot has returned to the home position." if ok else "Failed to move to home position."
 
-    async def _handle_stop_robot(self, args):
-        ok = await self.controller.stop_robot()
-        return ok, "Robot has stopped (not moving)." if ok else "Failed to stop robot."
-
     async def _handle_move_to_user(self, args):
         ok = await self.controller.move_to_user()
         return ok, "Robot has moved to the user position." if ok else "Failed to move to user position."
 
-    async def _handle_grasp_object(self, args):
-        object_label = (args or {}).get('object_label') or None
-        x = (args or {}).get('x')
-        y = (args or {}).get('y')
-        z = (args or {}).get('z')
-        if object_label:
-            ok, detail = await self.grasp_object_pipeline(object_label=object_label)
-        elif x is not None and y is not None and z is not None:
-            ok, detail = await self.grasp_object_pipeline(x=float(x), y=float(y), z=float(z))
-        else:
-            return False, "grasp_object requires either object_label or x/y/z coordinates."
-        return ok, (f"Grasped '{object_label or 'object at coordinates'}'." if ok else detail)
-
-    async def _handle_open_gripper(self, args):
-        self.controller.release_grasped_object()
-        ok = await self.controller.set_gripper(0.0)
-        return ok, "Gripper is now fully opened." if ok else "Failed to open gripper."
+    async def _handle_stop_robot(self, args):
+        ok = await self.controller.stop_robot()
+        return ok, "Robot has stopped (not moving)." if ok else "Failed to stop robot."
 
     async def _handle_move_to_position(self, args):
         if not self.current_robot_state:
             return False, "Failed: Robot state is not currently available."
-        tcp_x, tcp_y, tcp_z, theta_x, theta_y, theta_z = self.controller.get_tcp_pose()
-        x = float(args.get('x', tcp_x))
-        y = float(args.get('y', tcp_y))
-        z = float(args.get('z', tcp_z))
-        ok = await self.controller.move_to_pose(x, y, z, theta_x, theta_y, theta_z)
-        return ok, (f"Moved to coordinates (x={x:.3f}, y={y:.3f}, z={z:.3f})"
+        s = self.current_robot_state
+        x = float(args['x'])
+        y = float(args['y'])
+        z = float(args['z'])
+        # Keep the current wrist orientation, read straight from robot_state.
+        ok = await self.controller.move_to_pose(x, y, z, s.theta_x, s.theta_y, s.theta_z)
+        return ok, (f"Moved to coordinates (x={x:.3f}, y={y:.3f}, z={z:.3f})."
                     if ok else "Failed to reach target coordinates.")
+
+    async def _handle_move_relative(self, args):
+        if not self.current_robot_state:
+            return False, "Failed: Robot state is not currently available."
+        s = self.current_robot_state
+        dx = float((args or {}).get('dx', 0.0))
+        dy = float((args or {}).get('dy', 0.0))
+        dz = float((args or {}).get('dz', 0.0))
+        x, y, z = s.x + dx, s.y + dy, s.z + dz
+        ok = await self.controller.move_to_pose(x, y, z, s.theta_x, s.theta_y, s.theta_z)
+        return ok, (f"Moved by (dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}) to (x={x:.3f}, y={y:.3f}, z={z:.3f})."
+                    if ok else "Failed relative move.")
 
     async def _handle_adjust_joints(self, args):
         if not self.current_robot_state:
             return False, "Failed: Robot state is not currently available."
         angles = list(self.current_robot_state.joint_angles)
-        joint_idx = int(args.get('joint number', 0)) - 1
+        joint_idx = int(args.get('joint', 0)) - 1
         amount = float(args.get('amount', 0.0))
         if not (0 <= joint_idx < len(angles)):
             return False, f"Failed: Invalid joint number {joint_idx + 1}"
-        angles[joint_idx] += amount
+        # robot_state (and the controller's completion-polling wrap math) always represents joint
+        # angles in [0, 360) -- wrap here so an adjustment can never produce an out-of-range
+        # absolute target (e.g. 359 + 180 = 539), which breaks the C++ side's 360-degree-wrap
+        # distance check and stalls until its safety timeout instead of detecting completion.
+        angles[joint_idx] = (angles[joint_idx] + amount) % 360.0
         ok = await self.controller.move_to_joints(angles)
         return ok, (f"Adjusted joint {joint_idx + 1} by {amount} degrees."
                     if ok else "Failed joint adjustment movement.")
+
+    async def _handle_adjust_gripper(self, args):
+        action = (args or {}).get('action')
+        if action == 'open':
+            ok = await self.controller.set_gripper(0.0)
+            return ok, "Gripper is now fully opened." if ok else "Failed to open gripper."
+        if action == 'close':
+            ok = await self.controller.grasp_object()
+            if not ok:
+                return False, "Failed to close gripper."
+            return True, "Gripper closed." + self._gripper_closed_warning()
+        if action == 'custom':
+            width = (args or {}).get('width')
+            if width is None:
+                return False, "adjust_gripper action='custom' requires a width (meters)."
+            pct = grasp.width_to_gripper_percent(float(width))
+            ok = await self.controller.set_gripper(pct)
+            return ok, (f"Gripper set to accommodate {float(width) * 100:.1f} cm." if ok else "Failed to set gripper width.")
+        return False, f"adjust_gripper: unknown action {action!r} (expected 'open', 'close', or 'custom')."
+
+    async def _handle_grasp_simple_object(self, args):
+        if not self.current_robot_state:
+            return False, "Failed: Robot state is not currently available."
+        x = args.get('x'); y = args.get('y'); z = args.get('z')
+        if x is None or y is None or z is None:
+            return False, "grasp_simple_object requires x, y and z coordinates (from inspect_scene)."
+        width = (args or {}).get('width')
+        ok, detail = await self._grasp_simple(float(x), float(y), float(z),
+                                              width=float(width) if width is not None else None)
+        return ok, (f"Grasped object at ({float(x):.3f}, {float(y):.3f}, {float(z):.3f}).{detail}" if ok else detail)
+
+    async def _handle_grasp_complex_object(self, args):
+        object_label = (args or {}).get('object_label')
+        if not object_label:
+            return False, "grasp_complex_object requires object_label."
+        ok, detail = await self._grasp_anygrasp(object_label)
+        return ok, (f"Grasped '{object_label}'.{detail}" if ok else detail)
 
     async def _handle_inspect_scene(self, args):
         target_location = (args or {}).get('target_location') or None
@@ -474,15 +376,12 @@ class GeminiLiveBrainNode(Node):
         if self.latest_camera_info is None:
             return False, "Camera info not available.", None
 
-        # Fresh snapshot: clear stale obstacles so objects that moved/left don't linger.
-        self.controller.clear_dynamic_obstacles()
-
         # Snapshot all inputs so they can't change mid-pipeline
         cv_rgb = cv2.cvtColor(self.latest_rgb_image, cv2.COLOR_BGR2RGB)
         captured_depth = self.latest_depth_image.copy()
         orig_h, orig_w = captured_depth.shape
 
-        # Precompute 3D points map for cuboid dimension extraction
+        # Precompute 3D points map so each item's mask can be lifted into base_link for a width estimate
         fx, fy = self.latest_camera_info.k[0], self.latest_camera_info.k[4]
         cx, cy = self.latest_camera_info.k[2], self.latest_camera_info.k[5]
         scale = 1000.0
@@ -537,12 +436,13 @@ class GeminiLiveBrainNode(Node):
                 """)
 
         try:
-            raw = await self._query_gemini_json(prompt, img_resized)
+            raw = await perception.query_gemini_json(self.client, self.flash_model_id, prompt,
+                                                     img_resized, logger=self.get_logger())
         except Exception as e:
             self.get_logger().error(f"Error querying Gemini: {e}")
             return False, f"Inspection failed: {e}", None
 
-        items = list(self._iter_box_label_pairs(raw))
+        items = list(perception.iter_box_label_pairs(raw))
         self.get_logger().info(f"Processing {len(items)} detected items with SAM2...")
 
         if not items:
@@ -558,7 +458,7 @@ class GeminiLiveBrainNode(Node):
 
         annotated_img = img_resized.copy()
         draw = ImageDraw.Draw(annotated_img)
-        font = self._load_annotation_font(size=18)
+        font = perception.load_annotation_font(size=18)
         colors = ["red", "green", "blue", "yellow", "orange", "pink", "purple", "cyan", "magenta"]
 
         scene_report = "Scene Inspection Report:\n"
@@ -587,8 +487,8 @@ class GeminiLiveBrainNode(Node):
                 draw_label = label
                 report_prefix = f"- {label}"
 
-            # Draw the box FIRST — independent of whether depth succeeds. This used to live after
-            # the depth check, so items without valid depth silently dropped off the annotated image.
+            # Draw the box FIRST — independent of whether depth succeeds, so items without valid
+            # depth still appear on the annotated image.
             r_ymin = ymin_norm * new_height / 1000
             r_xmin = xmin_norm * new_width / 1000
             r_ymax = ymax_norm * new_height / 1000
@@ -596,7 +496,7 @@ class GeminiLiveBrainNode(Node):
             draw.rectangle(((r_xmin, r_ymin), (r_xmax, r_ymax)), outline=color, width=box_width)
             draw.text((r_xmin + 5, r_ymin + 5), draw_label, fill=color, font=font)
 
-            mask = await self._run_sam2(cv_rgb, (xmin, ymin, xmax, ymax))
+            mask = await perception.run_sam2(self.sam_predictor, cv_rgb, (xmin, ymin, xmax, ymax))
             if mask is None:
                 scene_report += f"{report_prefix}: Pose unknown (SAM2 not available).\n"
                 continue
@@ -607,73 +507,80 @@ class GeminiLiveBrainNode(Node):
                 continue
 
             depth_m = float(np.median(valid_depths)) / 1000.0
-            px, py = self._mask_centroid(mask, (xmin, ymin, xmax, ymax))
-            cx, cy, cz = vision_utils.get_3d_point_from_pixel(px, py, depth_m, self.latest_camera_info)
-            bx, by, bz = vision_utils.transform_point(cx, cy, cz, transform)
-            scene_report += f"{report_prefix}: Pose(x={bx:.3f}, y={by:.3f}, z={bz:.3f}) relative to base.\n"
+            px, py = perception.mask_centroid(mask, (xmin, ymin, xmax, ymax))
+            cx, cy, cz = perception.get_3d_point_from_pixel(px, py, depth_m, self.latest_camera_info)
+            bx, by, bz = perception.transform_point(cx, cy, cz, transform)
 
-            # Compute a tight PCA-oriented bounding box (OBB) for cuRobo obstacle registration.
-            # We keep Z world-vertical (upright table objects) and only rotate around Z (yaw OBB),
-            # which is both tighter than AABB for diagonal objects and avoids tilted boxes on the table.
+            width_str = ""
             if not is_target:
-                obj_points_cam = points_3d[mask].reshape(-1, 3)
-                obj_points_cam = obj_points_cam[(obj_points_cam[:, 2] > 0.1) & (obj_points_cam[:, 2] < 1.0)]
-                if obj_points_cam.shape[0] >= 10:
-                    T_base_cam = _transform_to_matrix(transform)
-                    ones = np.ones((obj_points_cam.shape[0], 1))
-                    obj_points_base = (T_base_cam @ np.hstack([obj_points_cam, ones]).T).T[:, :3]
+                width_m = perception.estimate_object_width(mask, points_3d, transform)
+                if width_m is not None:
+                    width_str = f" Estimated width: {width_m * 100:.1f} cm."
 
-                    # PCA on XY footprint only → principal yaw angle
-                    xy = obj_points_base[:, :2]
-                    xy_centered = xy - xy.mean(axis=0)
-                    cov = (xy_centered.T @ xy_centered) / max(len(xy_centered) - 1, 1)
-                    _, vecs = np.linalg.eigh(cov)
-                    # eigh returns ascending eigenvalues; primary axis = last column
-                    primary = vecs[:, -1]
-                    yaw = float(np.arctan2(primary[1], primary[0]))
-
-                    # Rotate points into the OBB frame, compute tight extents, rotate center back
-                    c_yaw, s_yaw = np.cos(-yaw), np.sin(-yaw)
-                    rot2d = np.array([[c_yaw, -s_yaw], [s_yaw, c_yaw]])
-                    pts_obb = (rot2d @ obj_points_base[:, :2].T).T
-                    obb_min = pts_obb.min(axis=0)
-                    obb_max = pts_obb.max(axis=0)
-                    obb_center_2d = (obb_min + obb_max) / 2.0
-                    # Rotate OBB center back to base frame
-                    center_base_xy = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]) @ obb_center_2d
-                    z_min = obj_points_base[:, 2].min()
-                    z_max = obj_points_base[:, 2].max()
-                    cuboid_center = [float(center_base_xy[0]), float(center_base_xy[1]), float((z_min + z_max) / 2.0)]
-                    cuboid_dims = [float(obb_max[0] - obb_min[0]), float(obb_max[1] - obb_min[1]), float(z_max - z_min)]
-
-                    # Convert yaw to wxyz quaternion (rotation around Z axis)
-                    quat_wxyz = [float(np.cos(yaw / 2)), 0.0, 0.0, float(np.sin(yaw / 2))]
-
-                    self.controller.update_dynamic_obstacle(clean_label, cuboid_center, cuboid_dims, quat_wxyz)
+            scene_report += f"{report_prefix}: Pose(x={bx:.3f}, y={by:.3f}, z={bz:.3f}) relative to base.{width_str}\n"
 
         self.get_logger().info(f"Annotated {len(items)} bounding boxes on inspection image.")
         return True, scene_report, annotated_img
 
-    # ---- Vision: 6D grasp ----
+    def _gripper_closed_warning(self):
+        """Returns a warning string if the gripper closed almost all the way after a grasp attempt
+        (common if robot missed the object). This can't distinguish "missed" from "grasped something very thin/soft" —
+        the system prompt tells Gemini to cross-check the camera image when it sees this warning.
+        """
+        if self.current_robot_state is None:
+            return ""
+        if self.current_robot_state.gripper_position >= grasp.GRIPPER_FULLY_CLOSED_THRESHOLD:
+            return (" WARNING: the gripper closed almost all the way. This can happen normally when "
+                    "grasping a thin or soft item, but may also mean the object was missed. Check the "
+                    "camera image to confirm the grasp before continuing.")
+        return ""
 
-    async def grasp_object_pipeline(self, object_label=None, x=None, y=None, z=None):
+    # ---- Grasp: simple top-down pick at a known point ----
+
+    async def _grasp_simple(self, x, y, z, width=None):
+        """Simple pick keeping the same orientation as the home position (or whatever orientation the robot is currently in): pre-shape the gripper to the object width, move to the object's
+        coordinates keeping the current wrist orientation, then close until contact. Coordinates and
+        width come from inspect_scene. No standoff and no fallbacks — a failed move logs and returns.
         """
-        Unified grasp pipeline. Two modes:
-          - object_label: AnyGrasp 6D vision pipeline (preferred for complex objects).
-          - x/y/z: SAM2+depth centroid fallback using given TCP contact coordinates,
-                   or if SAM2 also unavailable, direct Cartesian approach.
-        All Cartesian moves go through controller.move_to_pose() → cuRobo for collision avoidance.
-        """
-        if object_label:
-            return await self._grasp_anygrasp(object_label)
-        else:
-            return await self._grasp_cartesian(x, y, z)
+        if not await self._wait_for_frames(need_state=True):
+            self.get_logger().error("grasp_simple_object: robot state not available.")
+            return False, "Robot state not available."
+        s = self.current_robot_state
+
+        if width is not None:
+            pct = grasp.width_to_gripper_percent(width + 0.02)
+            self.get_logger().info(f"Pre-shaping gripper to {pct:.1f}% for {width * 100:.1f} cm object...")
+            await self.controller.set_gripper(pct)
+            await asyncio.sleep(1.0)
+
+        self.get_logger().info(f"Moving to object at ({x:.3f}, {y:.3f}, {z:.3f})...")
+        ok = await self.controller.move_to_pose(x, y, z, s.theta_x, s.theta_y, s.theta_z)
+        if not ok:
+            self.get_logger().error("grasp_simple_object: move to object failed.")
+            return False, "Move to object failed."
+
+        self.get_logger().info("Closing gripper...")
+        await self.controller.grasp_object()
+        return True, self._gripper_closed_warning()
+
+    # ---- Grasp: 6D AnyGrasp pick (complex objects, direct move, no fallbacks) ----
 
     async def _grasp_anygrasp(self, object_label):
-        self.get_logger().info(f"Executing AnyGrasp 6D grasp for: {object_label}")
+        """Barebones AnyGrasp pick: segment the object, take the single highest-confidence 6D grasp,
+        move directly to it, and close. No pre-grasp standoff, no candidate ranking, no fallbacks —
+        every failure logs an error and returns a failure detail so it is easy to diagnose.
+        """
+        self.get_logger().info(f"AnyGrasp grasp for: {object_label}")
 
         if not await self._wait_for_frames(need_camera_info=True, need_state=True):
+            self.get_logger().error("grasp_complex_object: sensor data not available.")
             return False, "Sensor data not available."
+        if self.sam_predictor is None:
+            self.get_logger().error("grasp_complex_object: SAM2 not available.")
+            return False, "SAM2 not available; cannot grasp."
+        if self.anygrasp is None:
+            self.get_logger().error("grasp_complex_object: AnyGrasp not available.")
+            return False, "AnyGrasp not available; cannot grasp."
 
         cv_rgb = cv2.cvtColor(self.latest_rgb_image, cv2.COLOR_BGR2RGB)
         pil_img = PILImage.fromarray(cv_rgb)
@@ -692,13 +599,16 @@ class GeminiLiveBrainNode(Node):
             """)
 
         try:
-            raw = await self._query_gemini_json(prompt, pil_img)
+            raw = await perception.query_gemini_json(self.client, self.flash_model_id, prompt,
+                                                     pil_img, logger=self.get_logger())
         except Exception as e:
-            return False, f"Gemini box parsing failed: {e}"
+            self.get_logger().error(f"grasp_complex_object: Gemini box query failed: {e}")
+            return False, f"Gemini box query failed: {e}"
 
-        pairs = list(self._iter_box_label_pairs(raw))
+        pairs = list(perception.iter_box_label_pairs(raw))
         if not pairs:
-            return False, f"Gemini did not return a valid bounding box. Raw: {raw}"
+            self.get_logger().error(f"grasp_complex_object: Gemini returned no bounding box. Raw: {raw}")
+            return False, "Gemini did not return a valid bounding box."
         box_2d, label = pairs[0]
         ymin_norm, xmin_norm, ymax_norm, xmax_norm = box_2d
 
@@ -707,18 +617,16 @@ class GeminiLiveBrainNode(Node):
         ymax = int(ymax_norm * h / 1000); xmax = int(xmax_norm * w / 1000)
 
         self.get_logger().info(f"Refining '{label}' segmentation with SAM2 box-prompt...")
-        binary_mask = await self._run_sam2(cv_rgb, (xmin, ymin, xmax, ymax))
+        binary_mask = await perception.run_sam2(self.sam_predictor, cv_rgb, (xmin, ymin, xmax, ymax))
         if binary_mask is None:
-            return False, "SAM2 not available; cannot run AnyGrasp without a mask. Use coordinate mode instead."
+            self.get_logger().error("grasp_complex_object: SAM2 returned no mask.")
+            return False, "SAM2 segmentation failed."
 
-        ag_points, ag_colors, lims = self._build_anygrasp_clouds(cv_rgb, binary_mask)
+        ag_points, ag_colors, lims = grasp.build_anygrasp_clouds(
+            self.latest_depth_image, self.latest_camera_info, cv_rgb, binary_mask)
         if ag_points is None:
+            self.get_logger().error("grasp_complex_object: target point cloud too small.")
             return False, "Target point cloud is too small."
-
-        if not self.anygrasp:
-            # AnyGrasp unavailable: fall back to depth-centroid approach using the SAM2 mask
-            self.get_logger().info("AnyGrasp not available — falling back to SAM2+depth centroid grasp.")
-            return await self._grasp_sam2_centroid(object_label, cv_rgb, binary_mask)
 
         self.get_logger().info("Querying AnyGrasp for 6D grasp generation...")
         torch.cuda.empty_cache()
@@ -728,223 +636,36 @@ class GeminiLiveBrainNode(Node):
             lims=lims, apply_object_mask=True, dense_grasp=True, collision_detection=True,
         )
         torch.cuda.empty_cache()
-        if len(gg) == 0:
+        if gg is None or len(gg) == 0:
+            self.get_logger().error("grasp_complex_object: AnyGrasp detected no grasps.")
             return False, "No grasps detected."
 
-        gg = gg.nms().sort_by_score()
-        best_grasp = gg[0]
-        self.get_logger().info(f"Best Grasp: Width={best_grasp.width:.3f}m, Depth={best_grasp.depth:.3f}m")
-
-        # Pre-shape gripper to grasp width before approach
-        desired_width = best_grasp.width + 0.02
-        target_gripper_pos = max(0.0, min(100.0, (0.14 - desired_width) / 0.14 * 100.0))
-        self.get_logger().info(f"Pre-shaping gripper to {target_gripper_pos:.1f}%...")
-        await self.controller.set_gripper(target_gripper_pos)
-        await asyncio.sleep(1.0)
+        # Barebones selection: highest-confidence candidate, nothing else.
+        best = gg.nms().sort_by_score()[0]
 
         try:
             t_base_cam = self.tf_buffer.lookup_transform(
                 'base_link', self.latest_camera_info.header.frame_id,
                 rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0),
             )
-        except Exception:
-            return False, "TF lookup failed"
+        except Exception as e:
+            self.get_logger().error(f"grasp_complex_object: TF lookup failed: {e}")
+            return False, "TF lookup failed."
+        T_base_cam = perception.transform_to_matrix(t_base_cam)
 
-        T_base_cam = _transform_to_matrix(t_base_cam)
-        R_align = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
-        T_cam_grasp = np.eye(4)
-        T_cam_grasp[:3, :3] = best_grasp.rotation_matrix
-        T_cam_grasp[:3,  3] = best_grasp.translation
-        T_base_grasp = T_base_cam @ T_cam_grasp
-        r_base_grasp = T_base_grasp[:3, :3] @ R_align
-        grasp_tcp = T_base_grasp[:3, 3]
+        xyz, euler = grasp.anygrasp_grasp_to_base_pose(best, T_base_cam)
 
-        # Pick wrist orientation closer to current to minimize unnecessary rotation
-        try:
-            t_current = self.tf_buffer.lookup_transform(
-                'base_link', 'end_effector_link',
-                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0),
-            )
-            R_curr = _transform_to_matrix(t_current)[:3, :3]
-            R_flip = r_base_grasp @ R.from_euler('z', 180, degrees=True).as_matrix()
-            if _angular_dist(R_curr, R_flip) < _angular_dist(R_curr, r_base_grasp):
-                r_base_grasp = R_flip
-        except Exception:
-            pass
-
-        approach_dist = best_grasp.depth + 0.02
-        approach_vector = r_base_grasp[:, 2]
-        orient_euler = R.from_matrix(r_base_grasp).as_euler('xyz', degrees=True)
-
-        pre_grasp_tcp = grasp_tcp - approach_dist * approach_vector
-
-        # Remove target obstacle so cuRobo doesn't block the approach
-        self.controller.remove_dynamic_obstacle(object_label)
-
-        self.get_logger().info("Moving to pre-grasp TCP position via cuRobo...")
-        ok = await self.controller.move_to_pose(
-            pre_grasp_tcp[0], pre_grasp_tcp[1], pre_grasp_tcp[2],
-            orient_euler[0], orient_euler[1], orient_euler[2],
-        )
+        self.get_logger().info(
+            f"Best grasp (score={best.score:.3f}, width={best.width:.3f}m): moving directly to "
+            f"({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})...")
+        ok = await self.controller.move_to_pose(xyz[0], xyz[1], xyz[2], euler[0], euler[1], euler[2])
         if not ok:
-            return False, "Pre-grasp move failed."
-
-        self.get_logger().info("Sliding to grasp TCP position...")
-        ok = await self.controller.move_to_pose(
-            grasp_tcp[0], grasp_tcp[1], grasp_tcp[2],
-            orient_euler[0], orient_euler[1], orient_euler[2],
-        )
-        if not ok:
-            return False, "Grasp approach move failed."
+            self.get_logger().error("grasp_complex_object: move to grasp pose failed.")
+            return False, "Move to grasp pose failed."
 
         self.get_logger().info("Closing gripper...")
         await self.controller.grasp_object()
-
-        # Record the held object for cuRobo carry collision checking
-        dims = [best_grasp.width, best_grasp.width, best_grasp.depth]
-        self.controller.attach_grasped_object(object_label, dims)
-        return True, ""
-
-    async def _grasp_sam2_centroid(self, object_label, cv_rgb, binary_mask):
-        """Fallback grasp: uses SAM2 mask centroid + depth for the TCP target, current EE orientation."""
-        self.get_logger().info(f"SAM2 centroid fallback grasp for '{object_label}'")
-
-        if self.latest_camera_info is None:
-            return False, "Camera info not available."
-
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                'base_link', self.latest_camera_info.header.frame_id,
-                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0),
-            )
-        except Exception as ex:
-            return False, f"TF lookup failed: {ex}"
-
-        # Centroid from mask + median depth
-        captured_depth = self.latest_depth_image.copy()
-        valid_depths = captured_depth[binary_mask][captured_depth[binary_mask] > 0]
-        if len(valid_depths) == 0:
-            return False, "No valid depth in SAM2 mask."
-        depth_m = float(np.median(valid_depths)) / 1000.0
-        h_img, w_img = cv_rgb.shape[:2]
-        M = cv2.moments(binary_mask.astype(np.uint8))
-        px = int(M["m10"] / M["m00"]) if M["m00"] != 0 else w_img // 2
-        py = int(M["m01"] / M["m00"]) if M["m00"] != 0 else h_img // 2
-        cx_c, cy_c, cz_c = vision_utils.get_3d_point_from_pixel(px, py, depth_m, self.latest_camera_info)
-        grasp_tcp = np.array(vision_utils.transform_point(cx_c, cy_c, cz_c, transform))
-
-        # Use current EE orientation for approach
-        _, _, _, orient_x, orient_y, orient_z = self.controller.get_tcp_pose()
-        approach_dist = 0.08
-
-        # Approach vector is the EE Z axis in world frame
-        r_current = R.from_euler('xyz', [orient_x, orient_y, orient_z], degrees=True)
-        approach_vector = r_current.as_matrix()[:, 2]
-        pre_grasp_tcp = grasp_tcp - approach_dist * approach_vector
-
-        # Open gripper fully (no width info without AnyGrasp)
-        await self.controller.set_gripper(0.0)
-        await asyncio.sleep(1.0)
-
-        self.controller.remove_dynamic_obstacle(object_label)
-
-        self.get_logger().info("Moving to pre-grasp TCP position (SAM2 centroid) via cuRobo...")
-        ok = await self.controller.move_to_pose(
-            pre_grasp_tcp[0], pre_grasp_tcp[1], pre_grasp_tcp[2],
-            orient_x, orient_y, orient_z,
-        )
-        if not ok:
-            return False, "Pre-grasp move failed."
-
-        self.get_logger().info("Sliding to grasp TCP position...")
-        ok = await self.controller.move_to_pose(
-            grasp_tcp[0], grasp_tcp[1], grasp_tcp[2],
-            orient_x, orient_y, orient_z,
-        )
-        if not ok:
-            return False, "Grasp approach move failed."
-
-        self.get_logger().info("Closing gripper...")
-        await self.controller.grasp_object()
-        self.controller.attach_grasped_object(object_label, [0.05, 0.05, 0.05])
-        return True, ""
-
-    async def _grasp_cartesian(self, x, y, z):
-        """Grasp using explicit TCP contact coordinates. Uses current EE orientation."""
-        self.get_logger().info(f"Executing Cartesian grasp at TCP ({x:.3f}, {y:.3f}, {z:.3f})")
-
-        if not await self._wait_for_frames(need_state=True):
-            return False, "Robot state not available."
-
-        grasp_tcp = np.array([x, y, z])
-        _, _, _, orient_x, orient_y, orient_z = self.controller.get_tcp_pose()
-        approach_dist = 0.08
-        r_current = R.from_euler('xyz', [orient_x, orient_y, orient_z], degrees=True)
-        approach_vector = r_current.as_matrix()[:, 2]
-        pre_grasp_tcp = grasp_tcp - approach_dist * approach_vector
-
-        await self.controller.set_gripper(0.0)
-        await asyncio.sleep(1.0)
-
-        self.get_logger().info("Moving to pre-grasp TCP position via cuRobo...")
-        ok = await self.controller.move_to_pose(
-            pre_grasp_tcp[0], pre_grasp_tcp[1], pre_grasp_tcp[2],
-            orient_x, orient_y, orient_z,
-        )
-        if not ok:
-            return False, "Pre-grasp move failed."
-
-        self.get_logger().info("Sliding to grasp TCP position...")
-        ok = await self.controller.move_to_pose(
-            grasp_tcp[0], grasp_tcp[1], grasp_tcp[2],
-            orient_x, orient_y, orient_z,
-        )
-        if not ok:
-            return False, "Grasp approach move failed."
-
-        self.get_logger().info("Closing gripper...")
-        await self.controller.grasp_object()
-        self.controller.attach_grasped_object("grasped_object", [0.05, 0.05, 0.05])
-        return True, ""
-
-    def _build_anygrasp_clouds(self, cv_rgb, binary_mask):
-        """Lift depth + mask into the (points, colors, lims) tuple AnyGrasp wants.
-        Returns (None, None, None) if the target mask has too few valid points.
-        """
-        h, w = cv_rgb.shape[:2]
-        depths = self.latest_depth_image.astype(np.float32)
-        fx, fy = self.latest_camera_info.k[0], self.latest_camera_info.k[4]
-        cx, cy = self.latest_camera_info.k[2], self.latest_camera_info.k[5]
-        scale = 1000.0
-
-        xmap, ymap = np.meshgrid(np.arange(w), np.arange(h))
-        points_z = depths / scale
-        points_x = (xmap - cx) / fx * points_z
-        points_y = (ymap - cy) / fy * points_z
-        points = np.stack([points_x, points_y, points_z], axis=-1).astype(np.float32)
-        colors = cv_rgb.astype(np.float32) / 255.0
-
-        target_points = points[binary_mask].reshape(-1, 3)
-        target_points = target_points[(target_points[:, 2] > 0.1) & (target_points[:, 2] < 1.0)]
-        if target_points.shape[0] < 10:
-            return None, None, None
-
-        margin = 0.005
-        obj_min, obj_max = target_points.min(axis=0), target_points.max(axis=0)
-        lims = [obj_min[0]-margin, obj_max[0]+margin,
-                obj_min[1]-margin, obj_max[1]+margin,
-                obj_min[2]-margin, obj_max[2]+margin]
-
-        scene_mask = (points[:, :, 2] > 0.2) & (points[:, :, 2] < 0.75)
-        full_points = points[scene_mask].reshape(-1, 3)
-        full_colors = colors[scene_mask].reshape(-1, 3)
-        full_obj_mask = binary_mask[scene_mask]
-
-        in_lims = ((full_points[:, 0] >= lims[0]) & (full_points[:, 0] <= lims[1]) &
-                   (full_points[:, 1] >= lims[2]) & (full_points[:, 1] <= lims[3]) &
-                   (full_points[:, 2] >= lims[4]) & (full_points[:, 2] <= lims[5]))
-        keep_mask = (in_lims & full_obj_mask) | (~in_lims)
-        return full_points[keep_mask], full_colors[keep_mask], lims
+        return True, self._gripper_closed_warning()
 
     # ---- Live session async tasks ----
 
@@ -959,7 +680,7 @@ class GeminiLiveBrainNode(Node):
         """Plays output audio chunks from the speaker queue."""
         try:
             stream = await asyncio.to_thread(
-                self.p.open, format=pyaudio.paInt16, channels=1, rate=24000, output=True,
+                self.p.open, format=pyaudio.paInt16, channels=1, rate=SPEAKER_RATE, output=True,
             )
             try:
                 while True:
@@ -972,7 +693,8 @@ class GeminiLiveBrainNode(Node):
             self.get_logger().error(f"Speaker stream error: {e}")
 
     async def video_stream_task(self, session):
-        """Streams camera frames to Gemini at ~1 fps without prompting state, to avoid output loops."""
+        """Streams camera frames to Gemini at ~1 fps. This is the model's only live sense — no
+        numeric robot state is ever sent."""
         while True:
             if self.latest_rgb_image is not None:
                 try:
@@ -1001,17 +723,24 @@ class GeminiLiveBrainNode(Node):
 
                 if response.server_content:
                     sc = response.server_content
+
+                    if sc.interrupted:
+                        # New turn started — drop queued speech so the robot stops talking over it.
+                        while not self.speaker_queue.empty():
+                            self.speaker_queue.get_nowait()
+
                     if sc.output_transcription:
                         self.transcription_buffer += sc.output_transcription.text
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
                             if part.inline_data:
                                 await self.speaker_queue.put(part.inline_data.data)
-                    if sc.turn_complete and self.transcription_buffer:
-                        text = self.transcription_buffer.strip()
-                        self.get_logger().info(f"[{_ts()}] - Received from model (Gemini): {text}")
-                        self.publish_chat_message("model", text)
-                        self.transcription_buffer = ""
+                    if sc.turn_complete:
+                        if self.transcription_buffer:
+                            text = self.transcription_buffer.strip()
+                            self.get_logger().info(f"[{_ts()}] - Received from model (Gemini): {text}")
+                            self.publish_chat_message("model", text)
+                            self.transcription_buffer = ""
 
                 if response.tool_call:
                     func_responses = []
@@ -1044,18 +773,27 @@ class GeminiLiveBrainNode(Node):
             system_instruction=self.system_instruction,
             tools=self.tools,
         )
+        tasks = []
         try:
             async with self.client.aio.live.connect(model=self.live_model_id, config=config) as session:
                 self.get_logger().info("Connected to Gemini Live!")
-                await asyncio.gather(
-                    self.video_stream_task(session),
-                    self.send_text_task(session),
-                    self.play_speaker_task(),
-                    self.receive_loop_task(session),
-                )
+                tasks = [
+                    asyncio.create_task(self.video_stream_task(session)),
+                    asyncio.create_task(self.send_text_task(session)),
+                    asyncio.create_task(self.play_speaker_task()),
+                    asyncio.create_task(self.receive_loop_task(session)),
+                ]
+                await asyncio.gather(*tasks)
         except Exception as e:
             self.get_logger().error(f"Live session failed: {e}")
         finally:
+            # Cancel siblings before terminating PyAudio — gather() leaves the other tasks
+            # running when one raises, and terminate() would yank the device out from under
+            # a live stream.
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self.p.terminate()
 
 

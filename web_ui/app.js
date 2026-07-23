@@ -14,12 +14,7 @@ const statePosition = document.getElementById('state-position');
 const stateOrientation = document.getElementById('state-orientation');
 const stateJoints = document.getElementById('state-joints');
 const stateGripper = document.getElementById('state-gripper');
-const stateSemantic = document.getElementById('state-semantic');
 
-const performanceBox = document.getElementById('performance-box');
-const completionTimeEl = document.getElementById('completion-time');
-
-let lastCommandStartTime = 0;
 let lastJointAngles = null;
 
 // Connection Callbacks
@@ -58,28 +53,10 @@ const voiceTriggerTopic = new ROSLIB.Topic({
 });
 
 // Subscribers
-const brainStatusListener = new ROSLIB.Topic({
-    ros : ros,
-    name : '/brain_status',
-    messageType : 'std_msgs/msg/String'
-});
-
 const geminiChatListener = new ROSLIB.Topic({
     ros : ros,
     name : '/gemini_chat',
     messageType : 'std_msgs/msg/String'
-});
-
-const semanticPositionListener = new ROSLIB.Topic({
-    ros : ros,
-    name : '/semantic_position',
-    messageType : 'std_msgs/msg/String'
-});
-
-semanticPositionListener.subscribe(function(message) {
-    if (stateSemantic) {
-        stateSemantic.textContent = message.data;
-    }
 });
 
 const voiceStatusListener = new ROSLIB.Topic({
@@ -90,62 +67,60 @@ const voiceStatusListener = new ROSLIB.Topic({
 
 const voiceStatusIndicator = document.getElementById('voice-status-indicator');
 const voiceStatusText = document.getElementById('voice-status-text');
+const voiceStatusDot = document.getElementById('voice-status-dot');
 const voiceBtn = document.getElementById('voice-btn');
-let isRecording = false;
+
+const VOICE_UI = {
+    IDLE:       { label: 'Hold to talk',   dot: 'bg-gray-400',               btn: 'text-gray-400' },
+    LISTENING:  { label: 'Listening…',     dot: 'bg-red-500 animate-pulse',  btn: 'text-red-600' },
+    PROCESSING: { label: 'Transcribing…',  dot: 'bg-blue-500 animate-pulse', btn: 'text-blue-600' },
+};
+const VOICE_BTN_COLORS = ['text-red-600', 'text-blue-600', 'text-gray-400'];
 
 if (voiceStatusListener && voiceStatusIndicator && voiceStatusText && voiceBtn) {
     voiceStatusListener.subscribe(function(message) {
-        const status = message.data;
-        if (status === 'IDLE') {
-            voiceStatusIndicator.classList.add('hidden');
-            voiceBtn.classList.remove('text-red-600', 'animate-pulse');
-            voiceBtn.classList.add('text-gray-400');
-            isRecording = false;
-        } else {
-            voiceStatusIndicator.classList.remove('hidden');
-            voiceStatusText.textContent = `Voice: ${status}`;
-            
-            if (status === 'LISTENING') {
-                voiceBtn.classList.add('text-red-600', 'animate-pulse');
-                voiceBtn.classList.remove('text-gray-400');
-                isRecording = true;
-            } else if (status === 'PROCESSING') {
-                voiceBtn.classList.remove('text-red-600', 'animate-pulse');
-                voiceBtn.classList.add('text-blue-600');
-            }
+        const ui = VOICE_UI[message.data];
+        if (!ui) return;
+
+        voiceStatusIndicator.classList.remove('hidden');
+        voiceStatusText.textContent = ui.label;
+        if (voiceStatusDot) {
+            voiceStatusDot.className = `inline-block w-2 h-2 rounded-full mr-2 ${ui.dot}`;
         }
+        voiceBtn.classList.remove(...VOICE_BTN_COLORS, 'animate-pulse');
+        voiceBtn.classList.add(ui.btn);
     });
 
-    voiceBtn.addEventListener('click', function() {
-        isRecording = !isRecording;
-        const msg = new ROSLIB.Message({
-            data: isRecording
-        });
-        voiceTriggerTopic.publish(msg);
-        
-        if (isRecording) {
-            addChatMessage('system', 'Voice command triggered...');
-        }
-    });
+    // Press-and-hold: True on press starts recording, False on release sends it for
+    // transcription — mirroring the physical Arduino button. Track state so a stray
+    // event (e.g. mouseleave after mouseup) can't publish a duplicate.
+    let holding = false;
+    const startTalk = function(e) {
+        if (e) e.preventDefault();
+        if (holding) return;
+        holding = true;
+        voiceTriggerTopic.publish(new ROSLIB.Message({ data: true }));
+    };
+    const stopTalk = function(e) {
+        if (e) e.preventDefault();
+        if (!holding) return;
+        holding = false;
+        voiceTriggerTopic.publish(new ROSLIB.Message({ data: false }));
+    };
+
+    voiceBtn.title = 'Hold to talk';
+    voiceBtn.addEventListener('mousedown', startTalk);
+    voiceBtn.addEventListener('mouseup', stopTalk);
+    voiceBtn.addEventListener('mouseleave', stopTalk);  // pointer slid off while held
+    voiceBtn.addEventListener('touchstart', startTalk);
+    voiceBtn.addEventListener('touchend', stopTalk);
+    voiceBtn.addEventListener('touchcancel', stopTalk);
 }
-
-brainStatusListener.subscribe(function(message) {
-    const data = message.data;
-    
-    // Check for latency report (time to start of move)
-    if (data.includes('LATENCY:')) {
-        const timeMatch = data.match(/LATENCY: ([\d.]+)s/);
-        if (timeMatch && performanceBox && completionTimeEl) {
-            performanceBox.classList.remove('hidden');
-            completionTimeEl.textContent = timeMatch[1] + 's';
-        }
-    }
-});
 
 geminiChatListener.subscribe(function(message) {
     try {
         const chatData = JSON.parse(message.data);
-        addChatMessage(chatData.role, chatData.text, chatData.image);
+        addChatMessage(chatData.role, chatData.text, chatData.image, chatData.source);
     } catch (e) {
         console.error("Failed to parse chat message:", e);
     }
@@ -214,12 +189,6 @@ if (commandForm && commandInput) {
             });
             instructionsTopic.publish(msg);
             commandInput.value = '';
-            
-            // Reset timer display for new command
-            if (performanceBox && completionTimeEl) {
-                performanceBox.classList.add('hidden');
-                completionTimeEl.textContent = '...';
-            }
         }
     });
 }
@@ -240,24 +209,34 @@ if (estopBtn) {
 }
 
 // Helper: Add message to chat container
-function addChatMessage(role, text, image = null) {
+function escapeHtml(s) {
+    const div = document.createElement('div');
+    div.textContent = s == null ? '' : String(s);
+    return div.innerHTML;
+}
+
+function addChatMessage(role, text, image = null, source = null) {
     if (!chatContainer) return;
 
     const messageEl = document.createElement('div');
     messageEl.classList.add('message', `message-${role}`);
-    
-    let contentHtml = `<div class="text-xs font-bold opacity-70 mb-1 uppercase tracking-tighter">${role}</div>`;
-    
+
+    // Mark messages that came from speech, to distinguish them from typed ones.
+    const micIcon = source === 'voice'
+        ? ' <i class="fas fa-microphone ml-1" title="Spoken"></i>'
+        : '';
+    let contentHtml = `<div class="text-xs font-bold opacity-70 mb-1 uppercase tracking-tighter">${escapeHtml(role)}${micIcon}</div>`;
+
     // Use whitespace-pre-wrap to preserve newlines and indentation in reports
-    contentHtml += `<div class="whitespace-pre-wrap font-mono mt-1 leading-relaxed">${text}</div>`;
-    
+    contentHtml += `<div class="whitespace-pre-wrap font-mono mt-1 leading-relaxed">${escapeHtml(text)}</div>`;
+
     if (image) {
         contentHtml += `<img src="${image}" class="message-image mt-2 rounded border border-black/10" alt="Scene Analysis">`;
     }
-    
+
     messageEl.innerHTML = contentHtml;
     chatContainer.appendChild(messageEl);
-    
+
     // Auto-scroll to bottom
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }

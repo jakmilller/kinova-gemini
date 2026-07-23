@@ -32,12 +32,6 @@
         </div>
 
         <div class="flex items-center gap-6">
-            <div id="performance-box" class="hidden md:flex items-center bg-blue-50 px-4 py-2 rounded-md border border-blue-100">
-                <div class="flex flex-col">
-                    <span class="text-[9px] font-bold text-blue-400 uppercase tracking-widest leading-none mb-1">Response Latency</span>
-                    <span id="completion-time" class="font-mono text-lg font-black text-blue-800 leading-none">--s</span>
-                </div>
-            </div>
             <button id="estop-btn" class="bg-red-600 hover:bg-red-700 text-white font-black py-3 px-8 rounded-md text-sm uppercase tracking-widest transition-all duration-150 shadow-lg border-b-4 border-red-900 active:border-b-0 active:translate-y-1">
                 Emergency stop
             </button>
@@ -65,15 +59,17 @@
 
             <!-- Chat Form Box (Embedded at the bottom of Chat Column) -->
             <div class="p-3 border-t border-gray-100 bg-white shrink-0">
-                <div id="voice-status-indicator" class="hidden mb-2 items-center gap-2 bg-blue-50 p-2 rounded text-blue-600 font-bold text-[10px] uppercase tracking-widest animate-pulse">
-                    <i class="fas fa-microphone"></i>
-                    <span id="voice-status-text">Voice Interface Active</span>
+                <!-- Voice is the primary input, so mic state is always visible rather than
+                     hidden until something happens. Driven by /voice_status. -->
+                <div id="voice-status-indicator" class="mb-2 flex items-center gap-1 bg-gray-50 p-2 rounded text-gray-600 font-bold text-[10px] uppercase tracking-widest">
+                    <span id="voice-status-dot" class="inline-block w-2 h-2 rounded-full mr-2 bg-gray-300"></span>
+                    <span id="voice-status-text">Connecting…</span>
                 </div>
                 <form id="command-form" class="relative flex gap-2">
                     <div class="relative flex-grow">
-                        <input type="text" id="command-input" autocomplete="off" placeholder="Command the robot (e.g., 'find the blue block')" 
+                        <input type="text" id="command-input" autocomplete="off" placeholder="Or type a command (voice is primary)"
                             class="w-full p-3 pr-12 border-2 border-gray-100 rounded-lg focus:outline-none focus:border-blue-500 bg-gray-50 text-sm font-medium transition-all duration-200 placeholder:text-gray-400">
-                        <button type="button" id="voice-btn" class="absolute right-2 top-2 bottom-2 text-gray-400 hover:text-blue-600 transition-colors duration-150 px-2">
+                        <button type="button" id="voice-btn" title="Hold to talk" class="absolute right-2 top-2 bottom-2 text-gray-400 hover:text-blue-600 transition-colors duration-150 px-2 select-none touch-none">
                             <i class="fas fa-microphone text-lg"></i>
                         </button>
                     </div>
@@ -107,12 +103,6 @@
         </div>
         
         <div class="flex flex-grow justify-around items-center gap-6">
-            <!-- Semantic Position -->
-            <div class="flex flex-col">
-                <span class="text-gray-400 font-bold uppercase text-[9px] tracking-widest leading-none mb-1">Semantic Config</span>
-                <span id="state-semantic" class="font-mono text-sm font-black text-gray-900 uppercase tracking-tighter">UNKNOWN</span>
-            </div>
-
             <!-- End Effector Position (XYZ) -->
             <div class="flex flex-col">
                 <span class="text-gray-400 font-bold uppercase text-[9px] tracking-widest leading-none mb-1">End Effector Pose (XYZ)</span>
