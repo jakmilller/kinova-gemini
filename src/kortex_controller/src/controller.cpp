@@ -154,45 +154,49 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
     auto result = std::make_shared<ros2_interfaces::action::MoveToPose::Result>();
     auto feedback = std::make_shared<ros2_interfaces::action::MoveToPose::Feedback>();
 
-    k_api::Base::Action action;
-    action.set_name("Cartesian Move");
-
-    k_api::Base::Pose current_pose;
+    // We reach a Cartesian goal by solving IK and moving in JOINT space, not with a Cartesian
+    // reach_pose. reach_pose drives the TCP on a straight line and holds/interpolates orientation
+    // for the whole path; because every caller passes the CURRENT wrist orientation as the target,
+    // that pins the wrist at a fixed orientation across the entire translation. On a 7-DOF arm that
+    // frequently over-constrains the path into a wrist singularity and the move stalls before
+    // arriving. A joint-space move only guarantees the ENDPOINT pose -- each joint interpolates
+    // freely in between, so the wrist is allowed to reorient along the way and simply lands on the
+    // requested 6D pose. (Trade-off: the TCP path is no longer a Cartesian straight line, and the
+    // Cartesian speed ceiling `speed_scaling` no longer applies -- joint moves run at the firmware
+    // ANGULAR_TRAJECTORY speed, same as reach_joint_angles elsewhere.)
+    k_api::Base::IKData ik_data;
     {
         std::lock_guard<std::mutex> lock(mApiMutex);
-        current_pose = mBase->GetMeasuredCartesianPose();
+        // Seed IK with the current configuration so it returns a nearby solution (same
+        // elbow/wrist branch) rather than an arbitrary one that would swing the arm around.
+        *ik_data.mutable_guess() = mBase->GetMeasuredJointAngles();
+    }
+    auto target_pose = ik_data.mutable_cartesian_pose();
+    target_pose->set_x(goal->x);
+    target_pose->set_y(goal->y);
+    target_pose->set_z(goal->z);
+    target_pose->set_theta_x(goal->theta_x);
+    target_pose->set_theta_y(goal->theta_y);
+    target_pose->set_theta_z(goal->theta_z);
+
+    k_api::Base::JointAngles ik_solution;
+    try {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        ik_solution = mBase->ComputeInverseKinematics(ik_data);
+    } catch (k_api::KDetailedException& ex) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "IK found no solution for target (%.3f, %.3f, %.3f): %s -- aborting move.",
+                     goal->x, goal->y, goal->z, ex.what());
+        result->success = false;
+        goal_handle->abort(result);
+        return;
     }
 
-    auto wrap_angle = [](float target, float current) {
-        float diff = target - current;
-        while (diff > 180.0f) { target -= 360.0f; diff -= 360.0f; }
-        while (diff < -180.0f) { target += 360.0f; diff += 360.0f; }
-        return target;
-    };
-
-    auto reach_pose = action.mutable_reach_pose();
-    auto pose = reach_pose->mutable_target_pose();
-    pose->set_x(goal->x);
-    pose->set_y(goal->y);
-    pose->set_z(goal->z);
-    pose->set_theta_x(wrap_angle(goal->theta_x, current_pose.theta_x()));
-    pose->set_theta_y(wrap_angle(goal->theta_y, current_pose.theta_y()));
-    pose->set_theta_z(wrap_angle(goal->theta_z, current_pose.theta_z()));
-
-    // No speed constraint by default: the arm's Cartesian speed is configured in the Kinova
-    // Web App (the CARTESIAN_TRAJECTORY soft limits), and that is the only place to change it.
-    // A constraint here is a ceiling BELOW that, never a way to exceed it -- an earlier
-    // hard-coded one (0.1 m/s, 20 deg/s) is why Cartesian moves used to crawl while
-    // execute_joints, which sets no constraint, ran at full speed.
-    //
-    // speed_scaling > 0 opts into a slower move (both fields must be set: Speed carries them
-    // as a pair, so leaving orientation at 0 would command zero rotation speed). Kortex applies
-    // the two independently and the move takes the longer of the two times.
-    if (goal->speed_scaling > 0) {
-        auto speed = reach_pose->mutable_constraint()->mutable_speed();
-        speed->set_translation(goal->speed_scaling);
-        speed->set_orientation(20.0f);
-    }
+    k_api::Base::Action action;
+    action.set_name("Joint Move (from pose)");
+    // ComputeInverseKinematics returns a JointAngles with per-joint identifiers already set,
+    // which is exactly what reach_joint_angles expects -- copy it straight in.
+    *action.mutable_reach_joint_angles()->mutable_joint_angles() = ik_solution;
 
     try {
         {
@@ -200,9 +204,8 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
             mBase->ExecuteAction(action);
         }
 
-        RCLCPP_INFO(this->get_logger(), "Executing Cartesian target: (%.3f, %.3f, %.3f)%s",
-                    goal->x, goal->y, goal->z,
-                    goal->speed_scaling > 0 ? " [speed-limited]" : "");
+        RCLCPP_INFO(this->get_logger(), "Executing joint-space move to pose target: (%.3f, %.3f, %.3f)",
+                    goal->x, goal->y, goal->z);
 
         // With no execution timeout, a move that never converges loops until it is cancelled --
         // so log distance_to_go every ~2s (20 * 100ms) to make a stalled move visible in Terminal 1.

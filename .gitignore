@@ -8,3 +8,4 @@ anygrasp_sdk/
 __pycache__/
 *.pyc
 .claude/
+.TimeRecord
