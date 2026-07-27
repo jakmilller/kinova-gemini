@@ -353,6 +353,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /grasp_marker
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: ProtectionZones
+      Namespaces:
+        {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /protection_zones
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

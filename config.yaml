@@ -1,32 +1,25 @@
 # configurable settings
 model:
-  flash: "gemini-3.1-flash-lite" # currently used
+  flash: "gemini-3.1-pro-preview" # for high-level perception tasks (inspect_scene, grasp box picks)
+  live: "gemini-3.1-flash-live-preview" # live reasoning + audio model
+  transcribe: "gemini-2.5-flash-lite" # fallback transcriber when local whisper is unavailable
 
-  robot: "gemini-3.1-flash-lite"
-  # other models
-        # gemini-robotics-er-1.5-preview
-        # gemini-2.5-flash-lite
-        # gemini-3-pro-preview
-        # gemini-3-flash-preview
+transcription:
+  backend: "whisper"                   # "whisper" (local, fast) | "gemini" (force cloud)
+  whisper_model: "base.en"             # tiny.en (fastest) | base.en | small.en (most accurate)
+  whisper_device: "cuda"               # "cuda" | "cpu"  (auto-falls back to cpu if cuda fails)
+  whisper_compute_type: "int8_float16" # low-VRAM + fast on GPU; use "int8" for cpu
 
+# pre-set home and user joint positions (degrees, Kortex 0-360 convention, base joint first)
 joint positions:
-  home: # overlook position
-  - 1.50153386592865
-  - 340.23284912109375
-  - 179.30038452148438
-  - 226.12844848632812
-  - 358.47509765625
-  - 329.6204528808594
-  - 92.11446380615234
-
-
-    # - 359.9328308105469
-    # - 4.317113399505615
-    # - 179.1765899658203
-    # - 267.7507019042969
-    # - 359.4789123535156
-    # - 278.1408996582031
-    # - 89.97930145263672
+  home:
+  - 0.0
+  - 340.2477111816406
+  - 179.29942321777344
+  - 226.14500427246094
+  - 358.47503662109375
+  - 329.5884704589844
+  - 92.11003875732422
 
   user:
   - 358.81866455078125
@@ -36,4 +29,17 @@ joint positions:
   - 359.0517578125
   - 24.46324348449707
   - 90.03659057617188
+
+# Static obstacles the arm must never enter, in base_link coordinates (meters).
+# Pushed as Kortex Protection Zones through the API
+static_obstacles:
+  table:
+    size: [2.0, 2.0, 0.1]
+    center: [0.4, 0.0, -0.06]
+  # ceiling:
+  #   size: [2.0, 2.0, 0.05]
+  #   center: [0.0, 0.0, 0.85]
+  # wall:
+  #   size: [0.1, 2.0, 2.0]
+  #   center: [-0.3, 0.0, 1.0]
 

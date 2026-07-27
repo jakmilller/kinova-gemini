@@ -2,22 +2,18 @@
 <package format="3">
   <name>kinova_bringup</name>
   <version>0.0.0</version>
-  <description>Launch files for Kinova robot system</description>
-  <maintainer email="your-email@todo.todo">Your Name</maintainer>
-  <license>TODO</license>
-  
+  <description>Bringup launch files and RViz config for the Kinova Gen3 robot system.</description>
+  <maintainer email="jmill.pro1@gmail.com">mcrr-lab</maintainer>
+  <license>Apache-2.0</license>
+
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <depend>rclpy</depend>
-  <depend>robot_state_publisher</depend>
 
-  <!-- can maybe remove these after moveit switch -->
-  <depend>kortex_description</depend>
-  <depend>tf2_ros</depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>kortex_description</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>kortex_controller</exec_depend>
+  <exec_depend>gemini_live_robotics</exec_depend>
 
-  <depend>kinova_gen3_7dof_robotiq_2f_85_moveit_config</depend>
-  <depend>kortex_driver</depend>
-  <depend>rtabmap_ros</depend>
-  
   <export>
     <build_type>ament_cmake</build_type>
   </export>

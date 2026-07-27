@@ -1,5 +1,5 @@
 # Goal
-float64[] joint_angles
+float64[] joint_angles # Target joint angles, degrees
 ---
 # Result
 bool success

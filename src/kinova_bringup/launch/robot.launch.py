@@ -1,7 +1,8 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, GroupAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource, AnyLaunchDescriptionSource
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import (
     Command,
     FindExecutable,
@@ -47,6 +48,25 @@ def generate_launch_description():
         'gripper',
         default_value='robotiq_2f_140',
         description='Gripper type'
+    )
+
+    # Boolean feature toggles (pass e.g. rviz:=false voice:=true on the command line)
+    rviz_arg = DeclareLaunchArgument(
+        'rviz',
+        default_value='true',
+        description='Launch RViz'
+    )
+
+    voice_arg = DeclareLaunchArgument(
+        'voice',
+        default_value='true',
+        description='Launch the push-to-talk voice interface node'
+    )
+
+    arduino_arg = DeclareLaunchArgument(
+        'arduino',
+        default_value='true',
+        description='Launch the physical Arduino button bridge node'
     )
 
     # robot description direct from pdf
@@ -130,21 +150,50 @@ def generate_launch_description():
         name="rviz2",
         arguments=["-d", rviz_config_file],
         output="screen",
+        condition=IfCondition(LaunchConfiguration('rviz')),
     )
 
-    realsense_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            PathJoinSubstitution([
-                FindPackageShare('realsense2_camera'),
-                'launch',
-                'rs_launch.py'
-            ])
-        ]),
-        launch_arguments={
-            'align_depth.enable': 'true',
-            'pointcloud.enable': 'true',
-            'camera_name': 'realsense',
-        }.items()
+    # Push-to-talk voice input nodes (packaged in gemini_live_robotics). Off by default so a
+    # plain `robot.launch.py` brings up only hardware + visualization; opt in with voice:=true.
+    voice_interface_node = Node(
+        package='gemini_live_robotics',
+        executable='voice_interface',
+        name='voice_interface_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('voice')),
+    )
+
+    arduino_trigger_node = Node(
+        package='gemini_live_robotics',
+        executable='arduino_trigger',
+        name='arduino_trigger_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('arduino')),
+    )
+
+    # forwarding=False stops this launch's own arguments (robot_ip, username, dof, gripper, ...)
+    # from being forwarded into the RealSense launch, which would otherwise reject each of them
+    # as an unsupported parameter and flood the console. RealSense still receives the arguments
+    # explicitly passed below.
+    realsense_launch = GroupAction(
+        scoped=True,
+        forwarding=False,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    PathJoinSubstitution([
+                        FindPackageShare('realsense2_camera'),
+                        'launch',
+                        'rs_launch.py'
+                    ])
+                ]),
+                launch_arguments={
+                    'align_depth.enable': 'true',
+                    'pointcloud.enable': 'true',
+                    'camera_name': 'realsense',
+                }.items()
+            )
+        ]
     )
 
     rosbridge_launch = IncludeLaunchDescription(
@@ -183,6 +232,9 @@ def generate_launch_description():
         robot_type_arg,
         dof_arg,
         gripper_arg,
+        rviz_arg,
+        voice_arg,
+        arduino_arg,
         controller_node,
         robot_state_publisher,
         realsense_transform,
@@ -191,4 +243,6 @@ def generate_launch_description():
         rosbridge_launch,
         web_video_server_node,
         rviz_node,
+        voice_interface_node,
+        arduino_trigger_node,
     ])

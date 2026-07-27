@@ -6,5 +6,3 @@ float64 theta_y
 float64 theta_z
 float64[7] joint_angles
 float64 gripper_position
-float64 gripper_velocity
-float64 gripper_current

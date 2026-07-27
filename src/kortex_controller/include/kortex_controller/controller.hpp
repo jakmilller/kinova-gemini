@@ -6,24 +6,23 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
-#include <std_srvs/srv/set_bool.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 // Kortex API
 #include <BaseClientRpc.h>
 #include <BaseCyclicClientRpc.h>
-#include <ActuatorConfigClientRpc.h>
 #include <SessionManager.h>
 #include <RouterClient.h>
 #include <TransportClientTcp.h>
 #include <mutex>
+#include <unordered_map>
 
 // Custom Interfaces
 #include "ros2_interfaces/msg/robot_state.hpp"
 #include "ros2_interfaces/action/move_to_pose.hpp"
 #include "ros2_interfaces/action/move_to_joints.hpp"
 #include "ros2_interfaces/action/gripper_command.hpp"
-#include "ros2_interfaces/srv/compute_ik.hpp"
 
 namespace k_api = Kinova::Api;
 
@@ -47,7 +46,6 @@ private:
     k_api::RouterClient* mRouter;
     k_api::Base::BaseClient* mBase;
     k_api::BaseCyclic::BaseCyclicClient* mBaseCyclic;
-    k_api::ActuatorConfig::ActuatorConfigClient* mActuatorConfig;
 
     // Mutex for thread-safe API access
     std::mutex mApiMutex;
@@ -58,24 +56,24 @@ private:
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGripperServer;
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGraspServer;
 
-    // Services
-    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr mSrvAdmittance;
-    rclcpp::Service<ros2_interfaces::srv::ComputeIK>::SharedPtr mSrvComputeIK;
-
     // Publishers and Timers
     rclcpp::Publisher<ros2_interfaces::msg::RobotState>::SharedPtr mPubState;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr mPubJointState;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mPubProtectionZones;
     rclcpp::TimerBase::SharedPtr mTimer;
 
+    // Protection zone name lookup (zone handle identifier -> config.yaml name) and
+    // the live firmware subscription that reports real-time zone crossings.
+    std::unordered_map<uint32_t, std::string> mZoneNamesByHandle;
+    k_api::Common::NotificationHandle mProtectionZoneNotifHandle;
+
     // Callbacks
-    void toggleAdmittance(const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
-                          std::shared_ptr<std_srvs::srv::SetBool::Response> response);
-    
-    void computeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
-                   std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response);
-    
     void publishState();
     float get_gripper_position();
+    void configureProtectionZonesFromConfig();
+    void publishProtectionZones();
+    void subscribeToProtectionZoneEvents();
+    void onProtectionZoneNotification(k_api::Base::ProtectionZoneNotification notification);
 
     // Action Handlers (Pose)
     rclcpp_action::GoalResponse handle_pose_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveToPose::Goal>);

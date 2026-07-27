@@ -4,13 +4,12 @@
   <name>ros2_interfaces</name>
   <version>0.0.0</version>
   <description>Custom ROS2 interfaces</description>
-  <maintainer email="mcrr-lab@todo.todo">mcrr-lab</maintainer>
-  <license>TODO: License declaration</license>
+  <maintainer email="jmill.pro1@gmail.com">mcrr-lab</maintainer>
+  <license>Apache-2.0</license>
 
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>trajectory_msgs</depend>
   <depend>action_msgs</depend>
   <buildtool_depend>ament_cmake_auto</buildtool_depend> <build_depend>rosidl_default_generators</build_depend>
 
