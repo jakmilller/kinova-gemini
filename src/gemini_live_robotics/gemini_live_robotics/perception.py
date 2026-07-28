@@ -115,39 +115,53 @@ def salvage_json_objects(text):
         # even when the model emits malformed pairs like `"label": "item name": "cup"`.
         labels = re.findall(r'"([^"]+)"', chunk)
         label = labels[-1] if labels else 'object'
-        items.append({'box_2d': box, 'label': label})
+        salvaged = {'box_2d': box, 'label': label}
+        # Depth is optional, so a miss here just means the grasp falls back to width.
+        depth_match = re.search(r'"depth(?:_cm)?"\s*:\s*([0-9.]+)', chunk)
+        if depth_match:
+            try:
+                salvaged['depth_cm'] = float(depth_match.group(1))
+            except ValueError:
+                pass
+        items.append(salvaged)
     return items
 
 
-def normalize_box_label(item):
-    """Return (box, label) from one Gemini-shaped dict, tolerating common key variants.
-    Returns (None, None) if no usable box is present.
+def normalize_item(item):
+    """Return (box, label, depth_cm) from one Gemini-shaped dict, tolerating key variants.
+    depth_cm is the model's estimate of the object's thickness through its middle, or None if
+    it did not supply one. Returns (None, None, None) if no usable box is present.
     """
     if not isinstance(item, dict):
-        return None, None
+        return None, None, None
     box = item.get('box_2d') or item.get('box')
     label = (item.get('label') or item.get('item name') or item.get('part name')
              or item.get('item_name') or item.get('part_name') or 'object')
+    depth_cm = item.get('depth_cm') or item.get('depth')
+    try:
+        depth_cm = float(depth_cm) if depth_cm is not None else None
+    except (TypeError, ValueError):
+        depth_cm = None
     if isinstance(box, list) and len(box) == 4:
-        return box, label
-    return None, None
+        return box, label, depth_cm
+    return None, None, None
 
 
-def iter_box_label_pairs(value):
-    """Yield (box_2d, label) pairs out of any reasonable Gemini response shape:
+def iter_scene_items(value):
+    """Yield (box_2d, label, depth_cm) tuples out of any reasonable Gemini response shape:
     bare list, single dict, dict-wrapped list, list of dicts, etc.
     """
     if isinstance(value, list):
         for item in value:
-            yield from iter_box_label_pairs(item)
+            yield from iter_scene_items(item)
     elif isinstance(value, dict):
-        box, label = normalize_box_label(value)
+        box, label, depth_cm = normalize_item(value)
         if box is not None:
-            yield box, label
+            yield box, label, depth_cm
         else:
             for v in value.values():
                 if isinstance(v, (list, dict)):
-                    yield from iter_box_label_pairs(v)
+                    yield from iter_scene_items(v)
 
 
 # ---- SAM2 segmentation ----

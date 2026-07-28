@@ -114,12 +114,12 @@ grasp_simple_object_tool = types.FunctionDeclaration(
     name="grasp_simple_object",
     description=(
         "Picks up an object at a known position with a single call. It pre-shapes the gripper to the "
-        "object's width, moves the gripper to the object's coordinates keeping the current (top-down) "
-        "orientation, and closes until contact. Use this for ordinary top-down picks. You MUST call "
-        "inspect_scene first to get the object's x/y/z position and width. After it succeeds the gripper "
-        "is closed around the object; use move_to_position to carry it and adjust_gripper(open) to release. "
-        "For objects with handles, rims, or complex shapes that need a side/angled grasp, use "
-        "grasp_complex_object instead."
+        "object's width, backs off to a pre-grasp pose a few centimeters in front of the object, moves "
+        "straight in along the gripper's axis, and closes. Use this for ordinary top-down picks. You "
+        "MUST call inspect_scene first to get the object's x/y/z, width and depth. "
+        "After it succeeds the gripper is closed around the object; use move_to_position to carry it "
+        "and adjust_gripper(open) to release. For objects with handles, rims, or complex shapes that "
+        "need a side/angled grasp, use grasp_complex_object instead."
     ),
     parameters=types.Schema(
         type="OBJECT",
@@ -129,9 +129,16 @@ grasp_simple_object_tool = types.FunctionDeclaration(
             "z": types.Schema(type="NUMBER", description="Object z coordinate in meters (base frame), from inspect_scene."),
             "width": types.Schema(
                 type="NUMBER",
-                description="OPTIONAL. The object's estimated width in meters (from inspect_scene). The gripper "
-                            "pre-shapes to this before approaching, reducing the chance of bumping neighbors. "
-                            "Omit only if no width estimate is available.",
+                description="OPTIONAL. The object's estimated width in meters (from inspect_scene's Width, "
+                            "converted from cm). The gripper pre-shapes to this before approaching, reducing "
+                            "the chance of bumping neighbors. Omit only if no width estimate is available.",
+            ),
+            "depth": types.Schema(
+                type="NUMBER",
+                description="OPTIONAL. The object's thickness front-to-back in meters (from inspect_scene's "
+                            "Depth, converted from cm). Sets how far the fingers travel past the object's "
+                            "surface before closing, so they end up around the middle of it rather than "
+                            "pinching the near edge. Omit only if no depth estimate is available.",
             ),
         },
         required=["x", "y", "z"],

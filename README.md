@@ -132,8 +132,9 @@ ros2 run gemini_live_robotics gemini_live_brain
 
 ## Notes & limitations
 
+- **No collision-aware planning:** each move is a single direct Kortex command, protected only by
+  Kortex's self-collision/singularity avoidance and any configured Protection Zones. Future work will implement more advanced manipulation strategies
+- **Use of preview models:** `gemini_live_brain_node` uses `gemini-3.1-flash-live-preview` to support real-time reasoning and decision making. Check [Gemini Documentation](https://ai.google.dev/gemini-api/docs/deprecations) for scheduled model depreciations and replacements.
 - **Compute:** SAM 2 + AnyGrasp + whisper run locally and want ≥8 GB VRAM. Drop the whisper model
   to `tiny.en` or `whisper_device: cpu` in `config.yaml` if VRAM is tight.
 - **Move speed** is a firmware soft limit set in the Kinova Web App, not in this repo.
-- **No collision-aware planning:** each move is a single direct Kortex command, protected only by
-  Kortex's self-collision/singularity avoidance and any configured Protection Zones. Future work will implement more advanced manipulation strategies

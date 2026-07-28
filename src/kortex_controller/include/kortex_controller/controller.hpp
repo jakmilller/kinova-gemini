@@ -17,11 +17,15 @@
 #include <TransportClientTcp.h>
 #include <mutex>
 #include <unordered_map>
+#include <chrono>
+#include <thread>
+#include <cmath>
 
 // Custom Interfaces
 #include "ros2_interfaces/msg/robot_state.hpp"
 #include "ros2_interfaces/action/move_to_pose.hpp"
 #include "ros2_interfaces/action/move_to_joints.hpp"
+#include "ros2_interfaces/action/move_linear.hpp"
 #include "ros2_interfaces/action/gripper_command.hpp"
 
 namespace k_api = Kinova::Api;
@@ -34,6 +38,9 @@ public:
     
     using MoveToJoints = ros2_interfaces::action::MoveToJoints;
     using GoalHandleJoints = rclcpp_action::ServerGoalHandle<MoveToJoints>;
+
+    using MoveLinear = ros2_interfaces::action::MoveLinear;
+    using GoalHandleLinear = rclcpp_action::ServerGoalHandle<MoveLinear>;
 
     using GripperCommand = ros2_interfaces::action::GripperCommand;
     using GoalHandleGripper = rclcpp_action::ServerGoalHandle<GripperCommand>;
@@ -53,6 +60,7 @@ private:
     // Action Servers
     rclcpp_action::Server<MoveToPose>::SharedPtr mActionPoseServer;
     rclcpp_action::Server<MoveToJoints>::SharedPtr mActionJointsServer;
+    rclcpp_action::Server<MoveLinear>::SharedPtr mActionLinearServer;
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGripperServer;
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGraspServer;
 
@@ -67,9 +75,26 @@ private:
     std::unordered_map<uint32_t, std::string> mZoneNamesByHandle;
     k_api::Common::NotificationHandle mProtectionZoneNotifHandle;
 
+    // How far past the firmware tool frame the fingertips reach when the gripper is FULLY
+    // CLOSED, in meters. The Robotiq 2F-140's fingers swing forward as they close, and the
+    // arm's tool offset is configured at the fully-open fingertip, so this is the full range
+    // of that shift. Loaded from config.yaml's `gripper` block at startup.
+    double mFingertipExtension;
+
     // Callbacks
     void publishState();
     float get_gripper_position();
+    float get_gripper_speed();
+
+    // --- Fingertip <-> firmware TCP geometry ---
+    // The arm's tool frame is a FIXED offset set in the Web App; Kortex has no concept of
+    // the fingers moving it. These convert between that fixed TCP and where the fingertips
+    // physically are, so that every coordinate crossing this node's action interface means
+    // "fingertips" regardless of what the gripper is doing.
+    void loadGripperGeometryFromConfig();
+    double fingertipExtension(float gripper_pct) const;
+    void toolZAxis(float theta_x, float theta_y, float theta_z, double out[3]) const;
+    k_api::Base::Pose shiftAlongToolZ(const k_api::Base::Pose& pose, double distance) const;
     void configureProtectionZonesFromConfig();
     void publishProtectionZones();
     void subscribeToProtectionZoneEvents();
@@ -86,6 +111,76 @@ private:
     rclcpp_action::CancelResponse handle_joints_cancel(const std::shared_ptr<GoalHandleJoints>);
     void handle_joints_accepted(const std::shared_ptr<GoalHandleJoints> goal_handle);
     void execute_joints(const std::shared_ptr<GoalHandleJoints> goal_handle);
+
+    // Action Handlers (Linear / straight-line move along the tool's own +Z)
+    rclcpp_action::GoalResponse handle_linear_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveLinear::Goal>);
+    rclcpp_action::CancelResponse handle_linear_cancel(const std::shared_ptr<GoalHandleLinear>);
+    void handle_linear_accepted(const std::shared_ptr<GoalHandleLinear> goal_handle);
+    void execute_linear(const std::shared_ptr<GoalHandleLinear> goal_handle);
+
+    // Outcome of the shared Cartesian completion poll below.
+    enum class PollOutcome { REACHED, CANCELLED, TIMED_OUT };
+
+    // Shared completion check for both Cartesian actions (MoveToPose and MoveLinear).
+    // Templated on the action type because the two are different generated C++ types but
+    // carry the same `distance_to_go` feedback field -- one implementation keeps their
+    // completion, cancellation and logging behaviour identical instead of letting two
+    // near-copies drift apart.
+    //
+    // target_* is in RAW firmware TCP space, matching GetMeasuredCartesianPose. Callers that
+    // accept a fingertip goal must convert it BEFORE calling this.
+    // timeout_s <= 0 waits indefinitely (the historical MoveToPose behaviour).
+    template<typename ActionT>
+    PollOutcome pollUntilCartesianTarget(
+        const std::shared_ptr<rclcpp_action::ServerGoalHandle<ActionT>> goal_handle,
+        double target_x, double target_y, double target_z,
+        const char* label, double timeout_s)
+    {
+        auto feedback = std::make_shared<typename ActionT::Feedback>();
+        const auto start = std::chrono::steady_clock::now();
+        int log_counter = 0;
+
+        while (rclcpp::ok()) {
+            if (goal_handle->is_canceling()) {
+                std::lock_guard<std::mutex> lock(mApiMutex);
+                mBase->Stop();
+                RCLCPP_WARN(this->get_logger(), "%s cancelled.", label);
+                return PollOutcome::CANCELLED;
+            }
+
+            k_api::Base::Pose current;
+            {
+                std::lock_guard<std::mutex> lock(mApiMutex);
+                current = mBase->GetMeasuredCartesianPose();
+            }
+
+            double dist = sqrt(pow(target_x - current.x(), 2) +
+                               pow(target_y - current.y(), 2) +
+                               pow(target_z - current.z(), 2));
+            feedback->distance_to_go = dist;
+            goal_handle->publish_feedback(feedback);
+            if (dist < 0.01) return PollOutcome::REACHED;
+
+            if (timeout_s > 0.0) {
+                double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (elapsed > timeout_s) {
+                    std::lock_guard<std::mutex> lock(mApiMutex);
+                    mBase->Stop();
+                    RCLCPP_ERROR(this->get_logger(),
+                        "%s timed out after %.1f s with %.3f m still to go -- stopping the arm.",
+                        label, elapsed, dist);
+                    return PollOutcome::TIMED_OUT;
+                }
+            }
+
+            // Log every ~2 s (20 * 100ms) so a stalled move is visible in Terminal 1.
+            if (++log_counter % 20 == 0) {
+                RCLCPP_INFO(this->get_logger(), "%s polling: distance_to_go = %.3f m", label, dist);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return PollOutcome::TIMED_OUT;
+    }
 
     // Action Handlers (Gripper)
     rclcpp_action::GoalResponse handle_gripper_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const GripperCommand::Goal>);

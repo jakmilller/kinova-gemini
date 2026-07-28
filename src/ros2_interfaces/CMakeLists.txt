@@ -18,6 +18,7 @@ set(msg_files
 
 set(action_files
   "action/GripperCommand.action"
+  "action/MoveLinear.action"
   "action/MoveToJoints.action"
   "action/MoveToPose.action"
 )

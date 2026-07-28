@@ -1,0 +1,13 @@
+# Goal
+# Straight-line Cartesian move along the tool's OWN +Z axis (the gripper's approach
+# direction), holding the current orientation. Relative rather than absolute so the
+# caller cannot specify a path that leaves the approach axis: the same action serves
+# the pre-grasp approach (positive) and the retreat (negative).
+float64 distance     # meters, signed: + moves the fingertips forward, - backs them off
+float32 speed        # m/s translation ceiling; 0.0 uses the controller's default
+---
+# Result
+bool success
+---
+# Feedback
+float64 distance_to_go

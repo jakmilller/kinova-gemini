@@ -8,7 +8,7 @@ import yaml
 import os
 
 # Import custom action interfaces
-from ros2_interfaces.action import MoveToPose, MoveToJoints, GripperCommand
+from ros2_interfaces.action import MoveToPose, MoveToJoints, MoveLinear, GripperCommand
 from ros2_interfaces.msg import RobotState
 
 
@@ -27,6 +27,7 @@ class KinovaRobotControllerROS2(Node):
         # --- Action Clients ---
         self._action_pose_client = ActionClient(self, MoveToPose, 'move_to_pose')
         self._action_joints_client = ActionClient(self, MoveToJoints, 'move_to_joints')
+        self._action_linear_client = ActionClient(self, MoveLinear, 'move_linear')
         self._action_gripper_client = ActionClient(self, GripperCommand, 'gripper_command')
         self._action_grasp_object = ActionClient(self, GripperCommand, 'grasp_object')
 
@@ -65,11 +66,17 @@ class KinovaRobotControllerROS2(Node):
         return await asyncio_future
 
     async def move_to_pose(self, x, y, z, theta_x=0.0, theta_y=0.0, theta_z=0.0, speed=0.0):
-        """Sends a MoveToPose action goal.
+        """Sends a MoveToPose action goal. x/y/z are FINGERTIP coordinates: the controller
+        corrects for how far the 2F-140's tips reach at the current gripper opening, so the
+        fingers land here whether they are open or closed.
 
-        speed is an optional Cartesian translation ceiling in m/s. Leave it at 0.0 (the default)
-        to move at the arm's configured speed; pass a value only to make this one move SLOWER.
-        The arm's actual Cartesian speed is set in the Kinova Web App, not here.
+        This guarantees the ENDPOINT only -- the controller solves IK and moves through joint
+        space, so the path between here and there is not a straight line. Use move_linear when
+        the path matters (e.g. approaching an object that is already close to the jaws).
+
+        speed is currently IGNORED: it was a Cartesian translation ceiling back when this action
+        used Kortex's reach_pose, but the joint-space move runs at the firmware's
+        ANGULAR_TRAJECTORY speed, which is set in the Kinova Web App rather than here.
         """
         goal_msg = MoveToPose.Goal()
         goal_msg.x = x
@@ -82,6 +89,23 @@ class KinovaRobotControllerROS2(Node):
 
         self.get_logger().info(f'Sending Pose goal: X={x}, Y={y}, Z={z}')
         return await self._send_action_goal(self._action_pose_client, goal_msg)
+
+    async def move_linear(self, distance: float, speed: float = 0.0):
+        """Straight-line Cartesian move along the tool's own +Z, holding the current orientation.
+
+        distance is signed and in meters: positive drives the fingertips forward (the grasp
+        approach), negative backs them off (the retreat). Unlike move_to_pose -- which only
+        guarantees the endpoint, since it moves through joint space -- this guarantees the PATH,
+        which is what makes it safe to run with an object a few centimeters in front of the jaws.
+
+        speed is an m/s translation ceiling; 0.0 uses the controller's default approach speed.
+        """
+        goal_msg = MoveLinear.Goal()
+        goal_msg.distance = float(distance)
+        goal_msg.speed = float(speed)
+
+        self.get_logger().info(f'Sending Linear goal: {distance:+.3f} m along tool +Z')
+        return await self._send_action_goal(self._action_linear_client, goal_msg)
 
     async def move_to_joints(self, joint_angles: list):
         """Sends a MoveToJoints action goal (angles in degrees)."""

@@ -312,8 +312,10 @@ class GeminiLiveBrainNode(Node):
         if x is None or y is None or z is None:
             return False, "grasp_simple_object requires x, y and z coordinates (from inspect_scene)."
         width = (args or {}).get('width')
+        depth = (args or {}).get('depth')
         ok, detail = await self._grasp_simple(float(x), float(y), float(z),
-                                              width=float(width) if width is not None else None)
+                                              width=float(width) if width is not None else None,
+                                              depth=float(depth) if depth is not None else None)
         return ok, (f"Grasped object at ({float(x):.3f}, {float(y):.3f}, {float(z):.3f}).{detail}" if ok else detail)
 
     async def _handle_grasp_complex_object(self, args):
@@ -401,17 +403,22 @@ class GeminiLiveBrainNode(Node):
             You are viewing the workspace of a general manipulator robot.
             Identify all of the prominent items in the scene.
 
-            Return ONLY a valid JSON list. Each list element MUST be an object with EXACTLY these two keys:
-              "box_2d": a list [ymin, xmin, ymax, xmax] of integers normalized to 0-1000
-              "label":  a short descriptive string naming the item
+            Return ONLY a valid JSON list. Each list element MUST be an object with EXACTLY these three keys:
+              "box_2d":   a list [ymin, xmin, ymax, xmax] of integers normalized to 0-1000
+              "label":    a short descriptive string naming the item
+              "depth_cm": a number -- how THICK the item is front-to-back through its middle, in
+                          centimeters. Estimate this from what you know about the real object
+                          (a soda can is about 6.6 cm through, a marker about 1.5 cm, a book
+                          about 3 cm). This is a physical size estimate, NOT a distance from
+                          the camera.
 
             Do NOT use any other key names (do not use "box", "item name", or "part name").
-            Do NOT nest objects. Each item is one flat object with the two keys above.
+            Do NOT nest objects. Each item is one flat object with the three keys above.
 
             Example:
             [
-              {"box_2d": [100, 200, 300, 400], "label": "cup"},
-              {"box_2d": [500, 600, 700, 800], "label": "spoon"}
+              {"box_2d": [100, 200, 300, 400], "label": "soda can", "depth_cm": 6.6},
+              {"box_2d": [500, 600, 700, 800], "label": "marker", "depth_cm": 1.5}
             ]
             """)
 
@@ -426,12 +433,13 @@ class GeminiLiveBrainNode(Node):
                 to other objects in the scene. Use the same {{"box_2d": [...], "label": "..."}} shape,
                 but prefix the label with the literal string "TARGET: " so it can be told apart from
                 the regular items. This bounding box should be around the CENTER of the location, so it can be much smaller and more precise.
+                A region is not a physical object, so give it "depth_cm": 0.
 
                 Example with target_location = "third chess square forward from queen":
                 [
-                  {{"box_2d": [100, 200, 300, 400], "label": "queen"}},
-                  {{"box_2d": [120, 700, 200, 780], "label": "rook"}},
-                  {{"box_2d": [410, 380, 500, 470], "label": "TARGET: third square forward from queen"}}
+                  {{"box_2d": [100, 200, 300, 400], "label": "queen", "depth_cm": 3.0}},
+                  {{"box_2d": [120, 700, 200, 780], "label": "rook", "depth_cm": 2.5}},
+                  {{"box_2d": [410, 380, 500, 470], "label": "TARGET: third square forward from queen", "depth_cm": 0}}
                 ]
                 """)
 
@@ -442,7 +450,7 @@ class GeminiLiveBrainNode(Node):
             self.get_logger().error(f"Error querying Gemini: {e}")
             return False, f"Inspection failed: {e}", None
 
-        items = list(perception.iter_box_label_pairs(raw))
+        items = list(perception.iter_scene_items(raw))
         self.get_logger().info(f"Processing {len(items)} detected items with SAM2...")
 
         if not items:
@@ -463,7 +471,7 @@ class GeminiLiveBrainNode(Node):
 
         scene_report = "Scene Inspection Report:\n"
 
-        for i, (box_2d, label) in enumerate(items):
+        for i, (box_2d, label, depth_cm) in enumerate(items):
             ymin_norm, xmin_norm, ymax_norm, xmax_norm = box_2d
             # Original-resolution coords for SAM2 / depth lookup
             ymin = int(ymin_norm * orig_h / 1000)
@@ -506,18 +514,26 @@ class GeminiLiveBrainNode(Node):
                 scene_report += f"{report_prefix}: Pose unknown (no valid depth in mask).\n"
                 continue
 
+            # Median over the masked pixels: a robust point on the object's camera-facing
+            # surface. The grasp standoff and forward insertion are both measured from this
+            # point, so it is the reference the whole approach geometry hangs off.
             depth_m = float(np.median(valid_depths)) / 1000.0
             px, py = perception.mask_centroid(mask, (xmin, ymin, xmax, ymax))
             cx, cy, cz = perception.get_3d_point_from_pixel(px, py, depth_m, self.latest_camera_info)
             bx, by, bz = perception.transform_point(cx, cy, cz, transform)
 
-            width_str = ""
+            size_str = ""
             if not is_target:
                 width_m = perception.estimate_object_width(mask, points_3d, transform)
                 if width_m is not None:
-                    width_str = f" Estimated width: {width_m * 100:.1f} cm."
+                    size_str += f" Width: {width_m * 100:.1f} cm."
+                # depth_cm is Gemini's semantic estimate, not a measurement, so sanity-check it
+                # before it reaches the model's reasoning. Wildly wrong values are dropped rather
+                # than reported; grasp_simple_object falls back to width when depth is missing.
+                if depth_cm is not None and 0.2 <= depth_cm <= 50.0:
+                    size_str += f" Depth: {depth_cm:.1f} cm."
 
-            scene_report += f"{report_prefix}: Pose(x={bx:.3f}, y={by:.3f}, z={bz:.3f}) relative to base.{width_str}\n"
+            scene_report += f"{report_prefix}: Pose(x={bx:.3f}, y={by:.3f}, z={bz:.3f}) relative to base.{size_str}\n"
 
         self.get_logger().info(f"Annotated {len(items)} bounding boxes on inspection image.")
         return True, scene_report, annotated_img
@@ -537,27 +553,56 @@ class GeminiLiveBrainNode(Node):
 
     # ---- Grasp: simple top-down pick at a known point ----
 
-    async def _grasp_simple(self, x, y, z, width=None):
-        """Simple pick keeping the same orientation as the home position (or whatever orientation the robot is currently in): pre-shape the gripper to the object width, move to the object's
-        coordinates keeping the current wrist orientation, then close until contact. Coordinates and
-        width come from inspect_scene. No standoff and no fallbacks — a failed move logs and returns.
+    async def _grasp_simple(self, x, y, z, width=None, depth=None):
+        """Pre-shape, approach from a standoff, drive straight in, close.
+
+        (x, y, z) is the object's surface point from inspect_scene (median depth over the visible
+        mask), and the approach axis is the gripper's own +Z at whatever orientation the wrist
+        currently holds — so this works for a top-down pick or an angled one without caring which
+        it is. Both the standoff and the insertion are measured from that reported point.
+
+        The sequence exists to keep the fingers away from the object until they are lined up
+        with it: the pre-grasp sits GRASP_STANDOFF_M back along the approach axis, and only then
+        do the fingertips travel in along a guaranteed straight line. Going directly to the
+        object instead would let the joint-space path arc a finger through it on the way.
+
+        No fallbacks — a failed step logs and returns a diagnostic string.
         """
         if not await self._wait_for_frames(need_state=True):
             self.get_logger().error("grasp_simple_object: robot state not available.")
             return False, "Robot state not available."
+        # Orientation is captured once and held for the whole grasp: it defines the approach
+        # axis, and nothing below changes it. Pre-shaping the gripper does not move the wrist.
         s = self.current_robot_state
 
         if width is not None:
             pct = grasp.width_to_gripper_percent(width + 0.02)
             self.get_logger().info(f"Pre-shaping gripper to {pct:.1f}% for {width * 100:.1f} cm object...")
+            # No sleep needed: the gripper action now returns once the fingers have settled, and
+            # the controller reads the gripper straight from the arm when it compensates the
+            # fingertip offset, so there is no topic-staleness race to wait out.
             await self.controller.set_gripper(pct)
-            await asyncio.sleep(1.0)
 
-        self.get_logger().info(f"Moving to object at ({x:.3f}, {y:.3f}, {z:.3f})...")
-        ok = await self.controller.move_to_pose(x, y, z, s.theta_x, s.theta_y, s.theta_z)
+        approach = grasp.shift_along_tool_z(x, y, z, s.theta_x, s.theta_y, s.theta_z,
+                                            -grasp.GRASP_STANDOFF_M)
+        self.get_logger().info(
+            f"Moving to pre-grasp {grasp.GRASP_STANDOFF_M * 100:.0f} cm off the surface at "
+            f"({approach[0]:.3f}, {approach[1]:.3f}, {approach[2]:.3f})...")
+        ok = await self.controller.move_to_pose(approach[0], approach[1], approach[2],
+                                                s.theta_x, s.theta_y, s.theta_z)
         if not ok:
-            self.get_logger().error("grasp_simple_object: move to object failed.")
-            return False, "Move to object failed."
+            self.get_logger().error("grasp_simple_object: move to pre-grasp pose failed.")
+            return False, "Move to pre-grasp pose failed."
+
+        insertion = grasp.insertion_depth_m(depth, width)
+        travel = grasp.GRASP_STANDOFF_M + insertion
+        self.get_logger().info(
+            f"Approaching {travel * 100:.1f} cm along the gripper axis "
+            f"({grasp.GRASP_STANDOFF_M * 100:.0f} cm standoff + {insertion * 100:.1f} cm into the object)...")
+        ok = await self.controller.move_linear(travel)
+        if not ok:
+            self.get_logger().error("grasp_simple_object: straight-line approach failed.")
+            return False, "Straight-line approach to the object failed."
 
         self.get_logger().info("Closing gripper...")
         await self.controller.grasp_object()
@@ -605,11 +650,11 @@ class GeminiLiveBrainNode(Node):
             self.get_logger().error(f"grasp_complex_object: Gemini box query failed: {e}")
             return False, f"Gemini box query failed: {e}"
 
-        pairs = list(perception.iter_box_label_pairs(raw))
+        pairs = list(perception.iter_scene_items(raw))
         if not pairs:
             self.get_logger().error(f"grasp_complex_object: Gemini returned no bounding box. Raw: {raw}")
             return False, "Gemini did not return a valid bounding box."
-        box_2d, label = pairs[0]
+        box_2d, label, _ = pairs[0]  # AnyGrasp derives its own depth, so the estimate is unused here
         ymin_norm, xmin_norm, ymax_norm, xmax_norm = box_2d
 
         h, w = self.latest_rgb_image.shape[:2]
