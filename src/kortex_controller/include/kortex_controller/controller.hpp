@@ -27,6 +27,7 @@
 #include "ros2_interfaces/action/move_to_joints.hpp"
 #include "ros2_interfaces/action/move_linear.hpp"
 #include "ros2_interfaces/action/gripper_command.hpp"
+#include "ros2_interfaces/srv/compute_ik.hpp"
 
 namespace k_api = Kinova::Api;
 
@@ -64,6 +65,9 @@ private:
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGripperServer;
     rclcpp_action::Server<GripperCommand>::SharedPtr mActionGraspServer;
 
+    // Services
+    rclcpp::Service<ros2_interfaces::srv::ComputeIK>::SharedPtr mComputeIKService;
+
     // Publishers and Timers
     rclcpp::Publisher<ros2_interfaces::msg::RobotState>::SharedPtr mPubState;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr mPubJointState;
@@ -95,6 +99,20 @@ private:
     double fingertipExtension(float gripper_pct) const;
     void toolZAxis(float theta_x, float theta_y, float theta_z, double out[3]) const;
     k_api::Base::Pose shiftAlongToolZ(const k_api::Base::Pose& pose, double distance) const;
+
+    // Fingertip pose (+ the gripper opening it will be commanded at) -> joint solution.
+    // Shared by execute_pose and the compute_ik service so that a pose scored through the
+    // service is guaranteed to produce the same joint solution when it is actually executed:
+    // same TCP correction, same measured-joint IK seed, same call. Takes mApiMutex internally.
+    // gripper_pct < 0 means "use the gripper's current measured position".
+    // Returns false if IK found no solution; out_tcp_target is filled either way for logging.
+    bool solveFingertipIK(const k_api::Base::Pose& fingertip, float gripper_pct,
+                          k_api::Base::JointAngles& out_solution,
+                          k_api::Base::Pose& out_tcp_target,
+                          float& out_gripper_pct, std::string& out_error);
+
+    void handleComputeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
+                         std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response);
     void configureProtectionZonesFromConfig();
     void publishProtectionZones();
     void subscribeToProtectionZoneEvents();

@@ -97,6 +97,12 @@ Controller::Controller() : Node("kinova_controller")
         std::bind(&Controller::handle_grasp_cancel, this, _1),
         std::bind(&Controller::handle_grasp_accepted, this, _1));
 
+    // --- Services ---
+    // Read-only IK lookup, used to rank grasp candidates by how much joint motion each needs
+    // (and to reject unreachable ones) before committing the arm to a move.
+    this->mComputeIKService = this->create_service<ros2_interfaces::srv::ComputeIK>(
+        "compute_ik", std::bind(&Controller::handleComputeIK, this, _1, _2));
+
     // --- Telemetry Pub ---
     mPubState = this->create_publisher<ros2_interfaces::msg::RobotState>("robot_state", 10);
     mPubJointState = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
@@ -274,6 +280,80 @@ k_api::Base::Pose Controller::shiftAlongToolZ(const k_api::Base::Pose& pose, dou
     return shifted;
 }
 
+bool Controller::solveFingertipIK(const k_api::Base::Pose& fingertip, float gripper_pct,
+                                  k_api::Base::JointAngles& out_solution,
+                                  k_api::Base::Pose& out_tcp_target,
+                                  float& out_gripper_pct, std::string& out_error)
+{
+    k_api::Base::JointAngles ik_guess;
+    {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        // Seed IK with the current configuration so it returns a nearby solution (same
+        // elbow/wrist branch) rather than an arbitrary one that would swing the arm around.
+        ik_guess = mBase->GetMeasuredJointAngles();
+        out_gripper_pct = gripper_pct >= 0.0f ? gripper_pct : get_gripper_position();
+    }
+
+    // The pose is a FINGERTIP target. The arm's firmware tool frame is a fixed offset set at
+    // the fully-OPEN fingertip, and Kortex has no concept of the fingers moving it -- so at any
+    // partial closure the real tips sit fingertipExtension() further along tool +Z than the TCP
+    // does. Pull the commanded TCP back by exactly that much and the tips land on the target.
+    // With the gripper fully open the correction is zero and this is a no-op.
+    out_tcp_target = shiftAlongToolZ(fingertip, -fingertipExtension(out_gripper_pct));
+
+    k_api::Base::IKData ik_data;
+    *ik_data.mutable_guess() = ik_guess;
+    auto target_pose = ik_data.mutable_cartesian_pose();
+    target_pose->set_x(out_tcp_target.x());
+    target_pose->set_y(out_tcp_target.y());
+    target_pose->set_z(out_tcp_target.z());
+    target_pose->set_theta_x(out_tcp_target.theta_x());
+    target_pose->set_theta_y(out_tcp_target.theta_y());
+    target_pose->set_theta_z(out_tcp_target.theta_z());
+
+    try {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        out_solution = mBase->ComputeInverseKinematics(ik_data);
+        return true;
+    } catch (k_api::KDetailedException& ex) {
+        out_error = ex.what();
+        return false;
+    }
+}
+
+void Controller::handleComputeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
+                                 std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response)
+{
+    k_api::Base::Pose fingertip;
+    fingertip.set_x(request->x);
+    fingertip.set_y(request->y);
+    fingertip.set_z(request->z);
+    fingertip.set_theta_x(request->theta_x);
+    fingertip.set_theta_y(request->theta_y);
+    fingertip.set_theta_z(request->theta_z);
+
+    k_api::Base::JointAngles solution;
+    k_api::Base::Pose tcp_target;
+    float used_pct = 0.0f;
+    std::string error;
+
+    if (!solveFingertipIK(fingertip, request->gripper_percent, solution, tcp_target, used_pct, error)) {
+        // Not an error condition: callers use this service to FILTER unreachable grasp
+        // candidates, so "no solution" is an expected, frequent answer. Debug level keeps a
+        // 16-candidate ranking sweep from flooding the console.
+        RCLCPP_DEBUG(this->get_logger(),
+                     "compute_ik: no solution for fingertip (%.3f, %.3f, %.3f) at gripper %.1f%%: %s",
+                     request->x, request->y, request->z, used_pct, error.c_str());
+        response->success = false;
+        return;
+    }
+
+    for (int i = 0; i < 7 && i < solution.joint_angles_size(); ++i) {
+        response->joint_angles[i] = solution.joint_angles(i).value();
+    }
+    response->success = true;
+}
+
 // --- Action Execution ---
 void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
 {
@@ -291,11 +371,9 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
     // Cartesian speed ceiling `speed_scaling` no longer applies -- joint moves run at the firmware
     // ANGULAR_TRAJECTORY speed, same as reach_joint_angles elsewhere.)
     //
-    // The goal is a FINGERTIP target. The arm's firmware tool frame is a fixed offset set at
-    // the fully-OPEN fingertip, and Kortex has no concept of the fingers moving it -- so at any
-    // partial closure the real tips sit fingertipExtension() further along tool +Z than the TCP
-    // does. Pull the commanded TCP back by exactly that much and the tips land on the goal.
-    // With the gripper fully open the correction is zero and this is a no-op.
+    // The goal is a FINGERTIP target; solveFingertipIK applies the tool-frame correction and
+    // solves for the joints. It is shared with the compute_ik service so that a pose scored
+    // there resolves to the same joints here.
     k_api::Base::Pose fingertip_target;
     fingertip_target.set_x(goal->x);
     fingertip_target.set_y(goal->y);
@@ -304,34 +382,13 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
     fingertip_target.set_theta_y(goal->theta_y);
     fingertip_target.set_theta_z(goal->theta_z);
 
-    k_api::Base::JointAngles ik_guess;
-    float grip_pct;
-    {
-        std::lock_guard<std::mutex> lock(mApiMutex);
-        // Seed IK with the current configuration so it returns a nearby solution (same
-        // elbow/wrist branch) rather than an arbitrary one that would swing the arm around.
-        ik_guess = mBase->GetMeasuredJointAngles();
-        grip_pct = get_gripper_position();
-    }
-
-    const double extension = fingertipExtension(grip_pct);
-    const k_api::Base::Pose tcp_target = shiftAlongToolZ(fingertip_target, -extension);
-
-    k_api::Base::IKData ik_data;
-    *ik_data.mutable_guess() = ik_guess;
-    auto target_pose = ik_data.mutable_cartesian_pose();
-    target_pose->set_x(tcp_target.x());
-    target_pose->set_y(tcp_target.y());
-    target_pose->set_z(tcp_target.z());
-    target_pose->set_theta_x(tcp_target.theta_x());
-    target_pose->set_theta_y(tcp_target.theta_y());
-    target_pose->set_theta_z(tcp_target.theta_z());
-
     k_api::Base::JointAngles ik_solution;
-    try {
-        std::lock_guard<std::mutex> lock(mApiMutex);
-        ik_solution = mBase->ComputeInverseKinematics(ik_data);
-    } catch (k_api::KDetailedException& ex) {
+    k_api::Base::Pose tcp_target;
+    float grip_pct = 0.0f;
+    std::string ik_error;
+
+    // -1 => use the gripper's current measured opening.
+    if (!solveFingertipIK(fingertip_target, -1.0f, ik_solution, tcp_target, grip_pct, ik_error)) {
         // Log both frames: "no IK solution" is only diagnosable if you can see the fingertip
         // goal that was asked for AND the TCP pose that was actually handed to the solver.
         RCLCPP_ERROR(this->get_logger(),
@@ -339,7 +396,7 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
                      "[TCP target (%.3f, %.3f, %.3f), gripper at %.1f%% -> %.4f m extension]: %s -- aborting move.",
                      goal->x, goal->y, goal->z,
                      tcp_target.x(), tcp_target.y(), tcp_target.z(),
-                     grip_pct, extension, ex.what());
+                     grip_pct, fingertipExtension(grip_pct), ik_error.c_str());
         result->success = false;
         goal_handle->abort(result);
         return;

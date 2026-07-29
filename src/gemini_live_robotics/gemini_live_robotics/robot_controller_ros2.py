@@ -9,6 +9,7 @@ import os
 
 # Import custom action interfaces
 from ros2_interfaces.action import MoveToPose, MoveToJoints, MoveLinear, GripperCommand
+from ros2_interfaces.srv import ComputeIK
 from ros2_interfaces.msg import RobotState
 
 
@@ -30,6 +31,9 @@ class KinovaRobotControllerROS2(Node):
         self._action_linear_client = ActionClient(self, MoveLinear, 'move_linear')
         self._action_gripper_client = ActionClient(self, GripperCommand, 'gripper_command')
         self._action_grasp_object = ActionClient(self, GripperCommand, 'grasp_object')
+
+        # --- Service Clients ---
+        self._compute_ik_client = self.create_client(ComputeIK, 'compute_ik')
 
         # --- Subscription (to monitor state) ---
         self.state_sub = self.create_subscription(
@@ -89,6 +93,35 @@ class KinovaRobotControllerROS2(Node):
 
         self.get_logger().info(f'Sending Pose goal: X={x}, Y={y}, Z={z}')
         return await self._send_action_goal(self._action_pose_client, goal_msg)
+
+    async def compute_ik(self, x, y, z, theta_x, theta_y, theta_z, gripper_percent=-1.0):
+        """Ask the controller what joint angles reach this FINGERTIP pose, without moving.
+
+        Returns (success, joint_angles_degrees) — success=False means the arm cannot reach the
+        pose, which is a normal answer when filtering grasp candidates, not an error.
+
+        gripper_percent is the opening the gripper WILL be at for the move (the fingertip->TCP
+        correction depends on it); leave it negative to use the gripper's current position.
+        Because the controller solves this with the same helper and the same measured-joint seed
+        that move_to_pose uses, the angles returned here are the ones that move will produce.
+        """
+        if not self._compute_ik_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error('compute_ik service not available')
+            return False, None
+
+        request = ComputeIK.Request()
+        request.x = float(x)
+        request.y = float(y)
+        request.z = float(z)
+        request.theta_x = float(theta_x)
+        request.theta_y = float(theta_y)
+        request.theta_z = float(theta_z)
+        request.gripper_percent = float(gripper_percent)
+
+        response = await self._await_rclpy_future(self._compute_ik_client.call_async(request))
+        if not response.success:
+            return False, None
+        return True, list(response.joint_angles)
 
     async def move_linear(self, distance: float, speed: float = 0.0):
         """Straight-line Cartesian move along the tool's own +Z, holding the current orientation.
