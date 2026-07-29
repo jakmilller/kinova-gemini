@@ -21,7 +21,6 @@ class NetworkInterfaceNode(Node):
         super().__init__('network_interface_node')
         self.publisher = self.create_publisher(String, '/user_instructions', 10)
         self.create_subscription(String, '/brain_status', self.status_callback, 10)
-        self.timer = self.create_timer(0.1, self.run_interface)
         self.get_logger().info('Network Interface Node listening...')
 
         self.client_conn = None
@@ -84,18 +83,17 @@ class NetworkInterfaceNode(Node):
         self.publisher.publish(msg)
         self.get_logger().info(f'Published instruction from tablet: {instruction}')
 
-    def main(args=None):
-        rclpy.init(args=args)
-        node = NetworkInterfaceNode()
-        try:
-            rclpy.spin(node)
-        except SystemExit:
-            pass
-        except KeyboardInterrupt:
-            pass
-        finally:
-            node.destroy_node()
-            rclpy.shutdown()
-
-    if __name__ == '__main__':
-        main()
+def main(args=None):
+    rclpy.init(args=args)
+    node = NetworkInterfaceNode()
+    try:
+        rclpy.spin(node)
+    except SystemExit:
+        pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+if __name__ == '__main__':
+    main()
