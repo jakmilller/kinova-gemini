@@ -7,7 +7,9 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 
+import java.io.BufferedReader;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
@@ -23,6 +25,7 @@ public class BluetoothKitLink implements KitLink {
     private static final String TAG = "BluetoothKitLink";
     private static final UUID SPP_UUID =
             UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+    private static final int RFCOMM_CHANNEL = 1;
 
     private final String deviceMac;
     private Listener listener;
@@ -41,6 +44,7 @@ public class BluetoothKitLink implements KitLink {
             try {
                 BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
                 if (adapter == null) { notifyConn(false, "No Bluetooth adapter"); return; }
+                if (!adapter.isEnabled()) { notifyConn(false, "Bluetooth is off, turn it on and retry"); return; }
                 BluetoothDevice device = adapter.getRemoteDevice(deviceMac);
                 socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
                 adapter.cancelDiscovery();
@@ -48,7 +52,7 @@ public class BluetoothKitLink implements KitLink {
                 out = socket.getOutputStream();
                 running = true;
                 notifyConn(true, "Connected to kit " + deviceMac);
-                readLoop(socket.getInputStream());
+                readLoop(socket);
             } catch (Exception e) {
                 try {
                     socket = (BluetoothSocket)deviceMac.getClass()
@@ -66,19 +70,13 @@ public class BluetoothKitLink implements KitLink {
         }, "kit-bt-connect").start();
     }
 
-    private void readLoop(InputStream in) {
-        byte[] buf = new byte[1024];
-        StringBuilder line = new StringBuilder();
+    private void readLoop(BluetoothSocket s) {
         try {
-            while (running) {
-                int n = in.read(buf);
-                if (n < 0) break;
-                String chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
-                for (char c : chunk.toCharArray()) {
-                    if (c == '\n') {
-                        if (listener != null) listener.onKitStatus(line.toString());
-                        line.setLength(0);
-                    } else line.append(c);
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+            String line;
+            while (running && (line = br.readLine()) != null) {
+                if(listener != null && !line.isEmpty()){
+                    listener.onKitStatus(line);
                 }
             }
         } catch (Exception e) {
@@ -87,7 +85,7 @@ public class BluetoothKitLink implements KitLink {
     }
 
     @Override
-    public void sendCommand(@NonNull String command) {
+    public void sendInstruction(@NonNull String command) {
         new Thread(() -> {
             try {
                 if (out != null) {

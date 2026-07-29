@@ -16,18 +16,95 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Kit IP address"
-        android:textSize="16sp" />
+        android:text="How will you connect to the kit?"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="16dp" />
 
-    <EditText
-        android:id="@+id/hostField"
+    <RadioGroup
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="192.168.1.50"
-        android:inputType="textUri"
-        android:minHeight="48dp"
-        android:textSize="16sp"
-        android:layout_marginBottom="24dp" />
+        android:id="@+id/transportGroup"
+        android:orientation="horizontal"
+        android:layout_marginBottom="16dp">
+
+        <RadioButton
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:id="@+id/radioTcp"
+            android:minHeight="48dp"
+            android:textSize="16sp"
+            android:text="WiFi"></RadioButton>
+
+        <RadioButton
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:id="@+id/radioBluetooth"
+            android:minHeight="48dp"
+            android:textSize="16sp"
+            android:layout_marginStart="24dp"
+            android:text="Bluetooth"></RadioButton>
+    </RadioGroup>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:id="@+id/tcpSection">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Kit IP address"
+            android:textSize="16sp" />
+
+        <EditText
+            android:id="@+id/hostField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="192.168.1.50"
+            android:inputType="textUri"
+            android:minHeight="48dp"
+            android:textSize="16sp"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="This device must be on the same WiFi network as the kit"
+            android:textSize="16sp" />
+
+
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="24dp"
+        android:id="@+id/bluetoothSection">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Robot kit (paired bluetooth device)"
+            android:textSize="16sp" />
+
+        <Spinner
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:id="@+id/deviceSpinner"></Spinner>
+
+        <TextView
+            android:id="@+id/btHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="16sp" />
+
+
+    </LinearLayout>
 
     <Button
         android:id="@+id/saveButton"

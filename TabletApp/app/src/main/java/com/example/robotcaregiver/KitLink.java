@@ -13,13 +13,12 @@ public interface KitLink {
 
     interface Listener {
         void onKitStatus(@NonNull String status);
-        void onKitFrame(@NonNull byte[] jpeg);
         void onKitConnectionChanged(boolean connected, @NonNull String detail);
     }
 
     void connect();
     void disconnect();
-    void sendCommand(@NonNull String command);
+    void sendInstruction(@NonNull String command);
     void setListener(Listener listener);
     boolean isConnected();
 }

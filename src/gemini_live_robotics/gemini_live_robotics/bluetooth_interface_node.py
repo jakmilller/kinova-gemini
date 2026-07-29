@@ -1,28 +1,24 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String 
-import threading
 import socket
 import threading
 
-LISTEN_PORT = 9100
+RFCOMM_CHANNEL = 1
 
-class NetworkInterfaceNode(Node):
+class BluetoothInterfaceNode(Node):
     """
-    Tablet does speech-to-text and sends a plain text instruction over TCP socket. This node 
+    Tablet does speech-to-text and sends a plain text instruction over bluetooth. This node 
     receives the text and republishes to user_instructions (ala text_interface_node)
     
     Also forwards brain status strings back to the tablet
 
-    Tablet and kit must be on the same Wi-Fi network
     """
 
     def __init__(self):
-        super().__init__('network_interface_node')
+        super().__init__('bluetooth_interface_node')
         self.publisher = self.create_publisher(String, '/user_instructions', 10)
         self.create_subscription(String, '/brain_status', self.status_callback, 10)
-        self.timer = self.create_timer(0.1, self.run_interface)
-        self.get_logger().info('Network Interface Node listening...')
 
         self.client_conn = None
         self.client_lock = threading.Lock()
@@ -30,16 +26,25 @@ class NetworkInterfaceNode(Node):
         self.server_thread = threading.Thread(target=self.run_server, daemon=True)
         self.server_thread.start()
 
+        self.get_logger().info(f'Bluetooth interface node listening on RFCOMM ch {RFCOMM_CHANNEL}')
+
     def run_server(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        try:
+            server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+
+        except (AttributeError, OSError) as e:
+            self.get_logger().error(f'Cannot make BT socket ({e})')
+            return
+
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", LISTEN_PORT))
+        server.bind(("", RFCOMM_CHANNEL))
         server.listen(1)
 
         while True:
-            self.get_logger().info("Waiting for the app connection...")
+            self.get_logger().info("Waiting for the app BT connection...")
             conn, addr = server.accept()
-            self.get_logger().info(f'Tablet connected: {addr}')
+            self.get_logger().info(f'Tablet BT connected: {addr}')
 
             with self.client_lock:
                 self.client_conn = conn
@@ -76,17 +81,17 @@ class NetworkInterfaceNode(Node):
             try: 
                 conn.sendall((text + "\n"). encode("utf-8"))
             except OSError as e:
-                self.get_logger().warn(f'Failed to send status to tablet: {e}')
+                self.get_logger().warn(f'Failed to send BT status to tablet: {e}')
 
     def publish_instruction(self, instruction):
         msg = String()
         msg.data = instruction
         self.publisher.publish(msg)
-        self.get_logger().info(f'Published instruction from tablet: {instruction}')
+        self.get_logger().info(f'Published BT instruction from tablet: {instruction}')
 
     def main(args=None):
         rclpy.init(args=args)
-        node = NetworkInterfaceNode()
+        node = BluetoothInterfaceNode()
         try:
             rclpy.spin(node)
         except SystemExit:

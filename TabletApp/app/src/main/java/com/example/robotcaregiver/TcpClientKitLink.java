@@ -9,16 +9,12 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 
-public class TcpClientKitLink {
+public class TcpClientKitLink implements KitLink{
 
-    public interface Listener {
-        void onKitStatus(@NonNull String status);
-        void onConnectionChanged(boolean connected, @NonNull String detail);
-    }
 
     private final String host;
     private final int port;
-    private Listener listener;
+    private KitLink.Listener listener;
     private Socket socket;
     private OutputStream out;
     private boolean running;
@@ -28,7 +24,7 @@ public class TcpClientKitLink {
         this.port = port;
     }
 
-    public void setListener(Listener listener){ this.listener = listener; }
+    public void setListener(KitLink.Listener listener){ this.listener = listener; }
 
     public void connect() {
         new Thread(() -> {
@@ -86,6 +82,6 @@ public class TcpClientKitLink {
     }
 
     private void notifyConn(boolean connected, String detail) {
-        if(listener != null) listener.onConnectionChanged(connected, detail);
+        if(listener != null) listener.onKitConnectionChanged(connected, detail);
     }
 }

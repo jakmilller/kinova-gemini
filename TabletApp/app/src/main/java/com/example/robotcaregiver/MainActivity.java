@@ -40,7 +40,7 @@ public class MainActivity extends AppCompatActivity
     private Button settingsButton;
     private Button connectButton;
 
-    private TcpClientKitLink kit;
+    private KitLink kit;
     private AppSettings settings;
     private ActivityResultLauncher<Intent> speechLauncher;
     private ActivityResultLauncher<Intent> settingsLauncher;
@@ -108,7 +108,8 @@ public class MainActivity extends AppCompatActivity
         }
 
         connectedHost = host;
-        kit = new TcpClientKitLink(host, KIT_PORT);
+
+        kit = settings.isBluetooth() ? new BluetoothKitLink(settings.getKitMac()) : new TcpClientKitLink(host, KIT_PORT);
         kit.setListener(this);
 
         setStatus("Connecting to " + host + ": " + KIT_PORT + "...");
@@ -151,7 +152,7 @@ public class MainActivity extends AppCompatActivity
         runOnUiThread(() -> setStatus("Kit: " + status));
     }
 
-    @Override public void onConnectionChanged(boolean connected, @NonNull String detail) {
+    @Override public void onKitConnectionChanged(boolean connected, @NonNull String detail) {
         setConnectedUi(connected);
         runOnUiThread(() -> toast(detail));
     }

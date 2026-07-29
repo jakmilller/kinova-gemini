@@ -24,7 +24,8 @@ setup(
         'console_scripts': [
             'gemini_live_brain = gemini_live_robotics.gemini_live_brain_node:main',
             'voice_interface = gemini_live_robotics.voice_interface_node:main',
-            'network_interface = gemini_robotics.network_interface_node:main',
+            'network_interface = gemini_live_robotics.network_interface_node:main',
+            'bluetooth_interface = gemini_live_robotics.bluetooth_interface_node:main',
             'arduino_trigger = gemini_live_robotics.arduino_trigger_node:main',
         ],
     },
