@@ -1,0 +1,17 @@
+# Request: a FINGERTIP pose, same frame as MoveToPose's goal.
+float64 x
+float64 y
+float64 z
+float64 theta_x
+float64 theta_y
+float64 theta_z
+
+# The gripper opening (0 = open, 100 = closed) the arm WILL be at when this move runs.
+# The fingertip -> firmware TCP correction depends on it, so passing the intended opening makes
+# the pose evaluated here identical to the one move_to_pose will command. Negative means
+# "use whatever the gripper is at right now".
+float32 gripper_percent
+---
+# Response
+bool success
+float64[7] joint_angles   # degrees, Kortex 0-360 convention; only meaningful when success

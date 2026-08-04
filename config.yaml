@@ -10,6 +10,9 @@ transcription:
   whisper_device: "cuda"               # "cuda" | "cpu"  (auto-falls back to cpu if cuda fails)
   whisper_compute_type: "int8_float16" # low-VRAM + fast on GPU; use "int8" for cpu
 
+audio:
+  input_device: "ZAFFIRO"
+
 # pre-set home and user joint positions (degrees, Kortex 0-360 convention, base joint first)
 joint positions:
   home:
@@ -29,6 +32,20 @@ joint positions:
   - 359.0517578125
   - 24.46324348449707
   - 90.03659057617188
+
+# Robotiq 2F-140 fingertip geometry, measured along the tool's +Z from the arm's wrist
+# (meters). The 2F-140's fingers swing forward as they close, so the fingertips reach
+# ~3 cm further when fully closed than when fully open. Need this precision for accurate grasping.
+#
+# The arm's firmware tool offset (Kinova Web App -> Tool configuration) is set to
+# tcp_open_m, i.e. the FULLY-OPEN fingertip. kortex_controller uses the difference
+# between these two values to convert between that fixed firmware TCP and the true
+# fingertip position -- subtracting it from commanded poses and adding it to the pose
+# reported in robot_state -- so that every coordinate in the system means "fingertips",
+# whatever the gripper is doing. Keep tcp_open_m in sync with the Web App value.
+gripper:
+  tcp_open_m: 0.2002    # fingertip offset with the gripper fully open (= Web App tool offset)
+  tcp_closed_m: 0.230   # fingertip offset with the gripper fully closed
 
 # Static obstacles the arm must never enter, in base_link coordinates (meters).
 # Pushed as Kortex Protection Zones through the API

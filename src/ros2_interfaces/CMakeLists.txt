@@ -16,8 +16,13 @@ set(msg_files
   "msg/RobotState.msg"
 )
 
+set(srv_files
+  "srv/ComputeIK.srv"
+)
+
 set(action_files
   "action/GripperCommand.action"
+  "action/MoveLinear.action"
   "action/MoveToJoints.action"
   "action/MoveToPose.action"
 )
@@ -27,6 +32,7 @@ set(action_files
 # included in your .msg or .srv definitions.
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  ${srv_files}
   ${action_files}
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs builtin_interfaces
 )

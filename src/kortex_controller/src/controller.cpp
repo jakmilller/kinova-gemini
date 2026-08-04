@@ -12,6 +12,23 @@
 using namespace std;
 using namespace std::placeholders;
 
+namespace {
+// Fallback if config.yaml has no `gripper` block: Robotiq 2F-140 fully-closed fingertip
+// (0.230 m) minus fully-open fingertip (0.2002 m).
+constexpr double DEFAULT_FINGERTIP_EXTENSION_M = 0.0298;
+
+// Straight-line approach defaults. Deliberately slow -- this is the segment that ends with
+// the fingers around an object, so it is the one where overshoot is most expensive.
+constexpr float DEFAULT_LINEAR_SPEED_MPS = 0.05f;
+constexpr float LINEAR_ORIENTATION_SPEED_DPS = 15.0f;
+
+// Gripper settle detection: treat the fingers as moving above this speed, give the command
+// this long to get them started, and never wait longer than the timeout in total.
+constexpr float GRIPPER_MOVING_SPEED = 0.01f;
+constexpr double GRIPPER_START_GRACE_S = 0.5;
+constexpr double GRIPPER_SETTLE_TIMEOUT_S = 3.0;
+}  // namespace
+
 Controller::Controller() : Node("kinova_controller")
 {
     // --- Parameters ---
@@ -40,6 +57,10 @@ Controller::Controller() : Node("kinova_controller")
     mBase = new k_api::Base::BaseClient(mRouter);
     mBaseCyclic = new k_api::BaseCyclic::BaseCyclicClient(mRouter);
 
+    // Must run before the state timer starts: publishState uses the fingertip extension to
+    // convert the measured TCP into the fingertip pose it publishes.
+    loadGripperGeometryFromConfig();
+
     // Push config.yaml's static_obstacles into firmware Protection Zones on every
     // startup, so editing the config and relaunching is enough to keep the arm's
     // enforced no-go volumes in sync -- no separate setup script to remember to rerun.
@@ -58,6 +79,12 @@ Controller::Controller() : Node("kinova_controller")
         std::bind(&Controller::handle_joints_cancel, this, _1),
         std::bind(&Controller::handle_joints_accepted, this, _1));
 
+    this->mActionLinearServer = rclcpp_action::create_server<ros2_interfaces::action::MoveLinear>(
+        this, "move_linear",
+        std::bind(&Controller::handle_linear_goal, this, _1, _2),
+        std::bind(&Controller::handle_linear_cancel, this, _1),
+        std::bind(&Controller::handle_linear_accepted, this, _1));
+
     this->mActionGripperServer = rclcpp_action::create_server<ros2_interfaces::action::GripperCommand>(
         this, "gripper_command",
         std::bind(&Controller::handle_gripper_goal, this, _1, _2),
@@ -69,6 +96,12 @@ Controller::Controller() : Node("kinova_controller")
         std::bind(&Controller::handle_grasp_goal, this, _1, _2),
         std::bind(&Controller::handle_grasp_cancel, this, _1),
         std::bind(&Controller::handle_grasp_accepted, this, _1));
+
+    // --- Services ---
+    // Read-only IK lookup, used to rank grasp candidates by how much joint motion each needs
+    // (and to reject unreachable ones) before committing the arm to a move.
+    this->mComputeIKService = this->create_service<ros2_interfaces::srv::ComputeIK>(
+        "compute_ik", std::bind(&Controller::handleComputeIK, this, _1, _2));
 
     // --- Telemetry Pub ---
     mPubState = this->create_publisher<ros2_interfaces::msg::RobotState>("robot_state", 10);
@@ -113,6 +146,16 @@ void Controller::handle_joints_accepted(const std::shared_ptr<GoalHandleJoints> 
     std::thread{std::bind(&Controller::execute_joints, this, std::placeholders::_1), goal_handle}.detach();
 }
 
+rclcpp_action::GoalResponse Controller::handle_linear_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveLinear::Goal>) {
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+rclcpp_action::CancelResponse Controller::handle_linear_cancel(const std::shared_ptr<GoalHandleLinear>) {
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+void Controller::handle_linear_accepted(const std::shared_ptr<GoalHandleLinear> goal_handle) {
+    std::thread{std::bind(&Controller::execute_linear, this, std::placeholders::_1), goal_handle}.detach();
+}
+
 rclcpp_action::GoalResponse Controller::handle_gripper_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const GripperCommand::Goal>) {
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
@@ -147,52 +190,223 @@ float Controller::get_gripper_position()
     return 0.0f;
 }
 
+float Controller::get_gripper_speed()
+{
+    // Note: Mutex should be locked by caller, as with get_gripper_position().
+    try {
+        k_api::Base::GripperRequest request;
+        request.set_mode(k_api::Base::GripperMode::GRIPPER_SPEED);
+        auto measured = mBase->GetMeasuredGripperMovement(request);
+        if (measured.finger_size() > 0) {
+            return measured.finger(0).value();
+        }
+    } catch (...) {}
+    return 0.0f;
+}
+
+// --- Fingertip <-> firmware TCP geometry ---
+
+void Controller::loadGripperGeometryFromConfig()
+{
+    mFingertipExtension = DEFAULT_FINGERTIP_EXTENSION_M;
+    std::string config_path = this->get_parameter("config_path").as_string();
+
+    try {
+        YAML::Node config = YAML::LoadFile(config_path);
+        YAML::Node gripper = config["gripper"];
+        if (gripper && gripper["tcp_open_m"] && gripper["tcp_closed_m"]) {
+            double open_m = gripper["tcp_open_m"].as<double>();
+            double closed_m = gripper["tcp_closed_m"].as<double>();
+            double extension = closed_m - open_m;
+            if (extension < 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "config.yaml gripper.tcp_closed_m (%.4f) is less than tcp_open_m (%.4f) -- the "
+                    "fingertips cannot retract as they close. Ignoring and using %.4f m.",
+                    closed_m, open_m, mFingertipExtension);
+            } else {
+                mFingertipExtension = extension;
+                RCLCPP_INFO(this->get_logger(),
+                    "Gripper geometry: fingertips reach %.4f m further when closed "
+                    "(open TCP %.4f m -> closed %.4f m). The firmware tool offset must be set to the OPEN value.",
+                    mFingertipExtension, open_m, closed_m);
+                return;
+            }
+        }
+    } catch (const std::exception& ex) {
+        RCLCPP_WARN(this->get_logger(), "Could not read gripper geometry from '%s': %s",
+                    config_path.c_str(), ex.what());
+    }
+
+    RCLCPP_WARN(this->get_logger(),
+        "No usable 'gripper' block in config.yaml -- using default fingertip extension of %.4f m.",
+        mFingertipExtension);
+}
+
+double Controller::fingertipExtension(float gripper_pct) const
+{
+    // gripper_pct is Kortex's 0 = fully open .. 100 = fully closed. The firmware tool offset
+    // is configured at the fully-open fingertip, so the correction is zero there and grows to
+    // the full extension as the fingers swing forward. Linear between the two measured anchors.
+    double pct = std::max(0.0f, std::min(100.0f, gripper_pct));
+    return mFingertipExtension * pct / 100.0;
+}
+
+void Controller::toolZAxis(float theta_x, float theta_y, float theta_z, double out[3]) const
+{
+    // Kortex expresses orientation as extrinsic x-y-z Tait-Bryan angles in degrees, so the
+    // full rotation is R = Rz(theta_z) * Ry(theta_y) * Rx(theta_x). The tool's +Z expressed in
+    // base coordinates is R * [0,0,1] -- i.e. R's third column, written out directly here to
+    // avoid pulling in a matrix library for nine multiplications.
+    const double a = theta_x * M_PI / 180.0;
+    const double b = theta_y * M_PI / 180.0;
+    const double g = theta_z * M_PI / 180.0;
+    out[0] = cos(g) * sin(b) * cos(a) + sin(g) * sin(a);
+    out[1] = sin(g) * sin(b) * cos(a) - cos(g) * sin(a);
+    out[2] = cos(b) * cos(a);
+}
+
+k_api::Base::Pose Controller::shiftAlongToolZ(const k_api::Base::Pose& pose, double distance) const
+{
+    // The one geometric primitive in this file. Used three ways: -extension to turn a
+    // fingertip goal into a TCP command, +extension to turn measured TCP feedback into the
+    // fingertip pose, and +distance for the straight-line approach move.
+    double z_tool[3];
+    toolZAxis(pose.theta_x(), pose.theta_y(), pose.theta_z(), z_tool);
+
+    k_api::Base::Pose shifted(pose);
+    shifted.set_x(pose.x() + distance * z_tool[0]);
+    shifted.set_y(pose.y() + distance * z_tool[1]);
+    shifted.set_z(pose.z() + distance * z_tool[2]);
+    return shifted;
+}
+
+bool Controller::solveFingertipIK(const k_api::Base::Pose& fingertip, float gripper_pct,
+                                  k_api::Base::JointAngles& out_solution,
+                                  k_api::Base::Pose& out_tcp_target,
+                                  float& out_gripper_pct, std::string& out_error)
+{
+    k_api::Base::JointAngles ik_guess;
+    {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        // Seed IK with the current configuration so it returns a nearby solution (same
+        // elbow/wrist branch) rather than an arbitrary one that would swing the arm around.
+        ik_guess = mBase->GetMeasuredJointAngles();
+        out_gripper_pct = gripper_pct >= 0.0f ? gripper_pct : get_gripper_position();
+    }
+
+    // The pose is a FINGERTIP target. The arm's firmware tool frame is a fixed offset set at
+    // the fully-OPEN fingertip, and Kortex has no concept of the fingers moving it -- so at any
+    // partial closure the real tips sit fingertipExtension() further along tool +Z than the TCP
+    // does. Pull the commanded TCP back by exactly that much and the tips land on the target.
+    // With the gripper fully open the correction is zero and this is a no-op.
+    out_tcp_target = shiftAlongToolZ(fingertip, -fingertipExtension(out_gripper_pct));
+
+    k_api::Base::IKData ik_data;
+    *ik_data.mutable_guess() = ik_guess;
+    auto target_pose = ik_data.mutable_cartesian_pose();
+    target_pose->set_x(out_tcp_target.x());
+    target_pose->set_y(out_tcp_target.y());
+    target_pose->set_z(out_tcp_target.z());
+    target_pose->set_theta_x(out_tcp_target.theta_x());
+    target_pose->set_theta_y(out_tcp_target.theta_y());
+    target_pose->set_theta_z(out_tcp_target.theta_z());
+
+    try {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        out_solution = mBase->ComputeInverseKinematics(ik_data);
+        return true;
+    } catch (k_api::KDetailedException& ex) {
+        out_error = ex.what();
+        return false;
+    }
+}
+
+void Controller::handleComputeIK(const std::shared_ptr<ros2_interfaces::srv::ComputeIK::Request> request,
+                                 std::shared_ptr<ros2_interfaces::srv::ComputeIK::Response> response)
+{
+    k_api::Base::Pose fingertip;
+    fingertip.set_x(request->x);
+    fingertip.set_y(request->y);
+    fingertip.set_z(request->z);
+    fingertip.set_theta_x(request->theta_x);
+    fingertip.set_theta_y(request->theta_y);
+    fingertip.set_theta_z(request->theta_z);
+
+    k_api::Base::JointAngles solution;
+    k_api::Base::Pose tcp_target;
+    float used_pct = 0.0f;
+    std::string error;
+
+    if (!solveFingertipIK(fingertip, request->gripper_percent, solution, tcp_target, used_pct, error)) {
+        // Not an error condition: callers use this service to FILTER unreachable grasp
+        // candidates, so "no solution" is an expected, frequent answer. Debug level keeps a
+        // 16-candidate ranking sweep from flooding the console.
+        RCLCPP_DEBUG(this->get_logger(),
+                     "compute_ik: no solution for fingertip (%.3f, %.3f, %.3f) at gripper %.1f%%: %s",
+                     request->x, request->y, request->z, used_pct, error.c_str());
+        response->success = false;
+        return;
+    }
+
+    for (int i = 0; i < 7 && i < solution.joint_angles_size(); ++i) {
+        response->joint_angles[i] = solution.joint_angles(i).value();
+    }
+    response->success = true;
+}
+
 // --- Action Execution ---
 void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
 {
     const auto goal = goal_handle->get_goal();
     auto result = std::make_shared<ros2_interfaces::action::MoveToPose::Result>();
-    auto feedback = std::make_shared<ros2_interfaces::action::MoveToPose::Feedback>();
+
+    // We reach a Cartesian goal by solving IK and moving in JOINT space, not with a Cartesian
+    // reach_pose. reach_pose drives the TCP on a straight line and holds/interpolates orientation
+    // for the whole path; because every caller passes the CURRENT wrist orientation as the target,
+    // that pins the wrist at a fixed orientation across the entire translation. On a 7-DOF arm that
+    // frequently over-constrains the path into a wrist singularity and the move stalls before
+    // arriving. A joint-space move only guarantees the ENDPOINT pose -- each joint interpolates
+    // freely in between, so the wrist is allowed to reorient along the way and simply lands on the
+    // requested 6D pose. (Trade-off: the TCP path is no longer a Cartesian straight line, and the
+    // Cartesian speed ceiling `speed_scaling` no longer applies -- joint moves run at the firmware
+    // ANGULAR_TRAJECTORY speed, same as reach_joint_angles elsewhere.)
+    //
+    // The goal is a FINGERTIP target; solveFingertipIK applies the tool-frame correction and
+    // solves for the joints. It is shared with the compute_ik service so that a pose scored
+    // there resolves to the same joints here.
+    k_api::Base::Pose fingertip_target;
+    fingertip_target.set_x(goal->x);
+    fingertip_target.set_y(goal->y);
+    fingertip_target.set_z(goal->z);
+    fingertip_target.set_theta_x(goal->theta_x);
+    fingertip_target.set_theta_y(goal->theta_y);
+    fingertip_target.set_theta_z(goal->theta_z);
+
+    k_api::Base::JointAngles ik_solution;
+    k_api::Base::Pose tcp_target;
+    float grip_pct = 0.0f;
+    std::string ik_error;
+
+    // -1 => use the gripper's current measured opening.
+    if (!solveFingertipIK(fingertip_target, -1.0f, ik_solution, tcp_target, grip_pct, ik_error)) {
+        // Log both frames: "no IK solution" is only diagnosable if you can see the fingertip
+        // goal that was asked for AND the TCP pose that was actually handed to the solver.
+        RCLCPP_ERROR(this->get_logger(),
+                     "IK found no solution for fingertip target (%.3f, %.3f, %.3f) "
+                     "[TCP target (%.3f, %.3f, %.3f), gripper at %.1f%% -> %.4f m extension]: %s -- aborting move.",
+                     goal->x, goal->y, goal->z,
+                     tcp_target.x(), tcp_target.y(), tcp_target.z(),
+                     grip_pct, fingertipExtension(grip_pct), ik_error.c_str());
+        result->success = false;
+        goal_handle->abort(result);
+        return;
+    }
 
     k_api::Base::Action action;
-    action.set_name("Cartesian Move");
-
-    k_api::Base::Pose current_pose;
-    {
-        std::lock_guard<std::mutex> lock(mApiMutex);
-        current_pose = mBase->GetMeasuredCartesianPose();
-    }
-
-    auto wrap_angle = [](float target, float current) {
-        float diff = target - current;
-        while (diff > 180.0f) { target -= 360.0f; diff -= 360.0f; }
-        while (diff < -180.0f) { target += 360.0f; diff += 360.0f; }
-        return target;
-    };
-
-    auto reach_pose = action.mutable_reach_pose();
-    auto pose = reach_pose->mutable_target_pose();
-    pose->set_x(goal->x);
-    pose->set_y(goal->y);
-    pose->set_z(goal->z);
-    pose->set_theta_x(wrap_angle(goal->theta_x, current_pose.theta_x()));
-    pose->set_theta_y(wrap_angle(goal->theta_y, current_pose.theta_y()));
-    pose->set_theta_z(wrap_angle(goal->theta_z, current_pose.theta_z()));
-
-    // No speed constraint by default: the arm's Cartesian speed is configured in the Kinova
-    // Web App (the CARTESIAN_TRAJECTORY soft limits), and that is the only place to change it.
-    // A constraint here is a ceiling BELOW that, never a way to exceed it -- an earlier
-    // hard-coded one (0.1 m/s, 20 deg/s) is why Cartesian moves used to crawl while
-    // execute_joints, which sets no constraint, ran at full speed.
-    //
-    // speed_scaling > 0 opts into a slower move (both fields must be set: Speed carries them
-    // as a pair, so leaving orientation at 0 would command zero rotation speed). Kortex applies
-    // the two independently and the move takes the longer of the two times.
-    if (goal->speed_scaling > 0) {
-        auto speed = reach_pose->mutable_constraint()->mutable_speed();
-        speed->set_translation(goal->speed_scaling);
-        speed->set_orientation(20.0f);
-    }
+    action.set_name("Joint Move (from pose)");
+    // ComputeInverseKinematics returns a JointAngles with per-joint identifiers already set,
+    // which is exactly what reach_joint_angles expects -- copy it straight in.
+    *action.mutable_reach_joint_angles()->mutable_joint_angles() = ik_solution;
 
     try {
         {
@@ -200,39 +414,28 @@ void Controller::execute_pose(const std::shared_ptr<GoalHandlePose> goal_handle)
             mBase->ExecuteAction(action);
         }
 
-        RCLCPP_INFO(this->get_logger(), "Executing Cartesian target: (%.3f, %.3f, %.3f)%s",
-                    goal->x, goal->y, goal->z,
-                    goal->speed_scaling > 0 ? " [speed-limited]" : "");
+        RCLCPP_INFO(this->get_logger(),
+                    "Executing joint-space move to fingertip target: (%.3f, %.3f, %.3f)",
+                    goal->x, goal->y, goal->z);
 
-        // With no execution timeout, a move that never converges loops until it is cancelled --
-        // so log distance_to_go every ~2s (20 * 100ms) to make a stalled move visible in Terminal 1.
-        int log_counter = 0;
-        while (rclcpp::ok()) {
-            if (goal_handle->is_canceling()) {
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                mBase->Stop();
-                result->success = false;
-                goal_handle->canceled(result);
-                RCLCPP_WARN(this->get_logger(), "Cartesian move cancelled.");
-                return;
-            }
+        // Poll against the TCP target, not the fingertip goal: GetMeasuredCartesianPose reports
+        // the firmware TCP, so the completion check has to live in that same raw frame.
+        // timeout_s = 0 keeps the existing behaviour of waiting indefinitely for this action.
+        auto outcome = pollUntilCartesianTarget<MoveToPose>(
+            goal_handle, tcp_target.x(), tcp_target.y(), tcp_target.z(), "Pose move", 0.0);
 
-            k_api::Base::Pose current;
-            {
-                std::lock_guard<std::mutex> lock(mApiMutex);
-                current = mBase->GetMeasuredCartesianPose();
-            }
-
-            double dist = sqrt(pow(goal->x - current.x(), 2) + pow(goal->y - current.y(), 2) + pow(goal->z - current.z(), 2));
-            feedback->distance_to_go = dist;
-            goal_handle->publish_feedback(feedback);
-            if (dist < 0.01) break;
-            if (++log_counter % 20 == 0) {
-                RCLCPP_INFO(this->get_logger(), "Pose execution polling: distance_to_go = %.3f m", dist);
-            }
-            std::this_thread::sleep_for(100ms);
+        if (outcome == PollOutcome::CANCELLED) {
+            result->success = false;
+            goal_handle->canceled(result);
+            return;
         }
-        RCLCPP_INFO(this->get_logger(), "Cartesian target reached.");
+        if (outcome != PollOutcome::REACHED) {
+            result->success = false;
+            goal_handle->abort(result);
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Fingertip target reached.");
         result->success = true;
         goal_handle->succeed(result);
     } catch (k_api::KDetailedException& ex) {
@@ -335,6 +538,89 @@ void Controller::execute_joints(const std::shared_ptr<GoalHandleJoints> goal_han
     }
 }
 
+void Controller::execute_linear(const std::shared_ptr<GoalHandleLinear> goal_handle)
+{
+    const auto goal = goal_handle->get_goal();
+    auto result = std::make_shared<ros2_interfaces::action::MoveLinear::Result>();
+
+    k_api::Base::Pose current;
+    {
+        std::lock_guard<std::mutex> lock(mApiMutex);
+        current = mBase->GetMeasuredCartesianPose();
+    }
+
+    // NO fingertip compensation here, deliberately. This is a pure relative translation and the
+    // gripper does not move during it, so translating the TCP by `distance` translates the
+    // fingertips by exactly `distance`. Working in raw TCP space also keeps the target
+    // consistent with the GetMeasuredCartesianPose readings the completion poll compares against.
+    const k_api::Base::Pose target = shiftAlongToolZ(current, goal->distance);
+
+    k_api::Base::Action action;
+    action.set_name("Linear Move (tool Z)");
+    auto* constrained_pose = action.mutable_reach_pose();
+    auto* pose = constrained_pose->mutable_target_pose();
+    pose->set_x(target.x());
+    pose->set_y(target.y());
+    pose->set_z(target.z());
+    // Orientation copied from the current pose: this move translates only.
+    pose->set_theta_x(current.theta_x());
+    pose->set_theta_y(current.theta_y());
+    pose->set_theta_z(current.theta_z());
+
+    // This is the one place we WANT Kortex's Cartesian reach_pose rather than the IK +
+    // joint-space path execute_pose uses. reach_pose drives the TCP along a straight line and
+    // holds orientation for the whole path. Over a long transit that pins the wrist and can
+    // walk a 7-DOF arm into a singularity (which is exactly why execute_pose stopped using it).
+    // Over this segment it is precisely the behaviour we need: the orientation is already the
+    // grasp orientation and is not changing, the span is a few centimeters, and the straight
+    // line is the entire point -- joint interpolation would arc the fingers through the object
+    // the pre-grasp standoff exists to avoid.
+    const float speed = goal->speed > 0.0f ? goal->speed : DEFAULT_LINEAR_SPEED_MPS;
+    auto* speed_constraint = constrained_pose->mutable_constraint()->mutable_speed();
+    speed_constraint->set_translation(speed);
+    speed_constraint->set_orientation(LINEAR_ORIENTATION_SPEED_DPS);
+
+    try {
+        {
+            std::lock_guard<std::mutex> lock(mApiMutex);
+            mBase->ExecuteAction(action);
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Linear move: %.3f m along tool +Z at %.3f m/s -> (%.3f, %.3f, %.3f)",
+                    goal->distance, speed, target.x(), target.y(), target.z());
+
+        // Unlike execute_pose this one is bounded. An orientation-locked Cartesian segment can
+        // refuse to converge (e.g. started near a wrist singularity), and a grasp approach that
+        // hangs forever is worse than one that fails: allow 3x the nominal travel time plus a
+        // fixed margin for acceleration and the arm's own settling.
+        const double nominal_s = std::abs(goal->distance) / speed;
+        const double timeout_s = nominal_s * 3.0 + 5.0;
+
+        auto outcome = pollUntilCartesianTarget<MoveLinear>(
+            goal_handle, target.x(), target.y(), target.z(), "Linear move", timeout_s);
+
+        if (outcome == PollOutcome::CANCELLED) {
+            result->success = false;
+            goal_handle->canceled(result);
+            return;
+        }
+        if (outcome != PollOutcome::REACHED) {
+            result->success = false;
+            goal_handle->abort(result);
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Linear move complete.");
+        result->success = true;
+        goal_handle->succeed(result);
+    } catch (k_api::KDetailedException& ex) {
+        RCLCPP_ERROR(this->get_logger(), "Kortex Error during linear move: %s", ex.what());
+        result->success = false;
+        goal_handle->abort(result);
+    }
+}
+
 void Controller::execute_gripper(const std::shared_ptr<GoalHandleGripper> goal_handle)
 {
     const auto goal = goal_handle->get_goal();
@@ -351,8 +637,40 @@ void Controller::execute_gripper(const std::shared_ptr<GoalHandleGripper> goal_h
             std::lock_guard<std::mutex> lock(mApiMutex);
             mBase->SendGripperCommand(command);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        // TCP is now updated proactively in publishState
+
+        // Wait for the fingers to actually settle rather than sleeping a fixed 2 s. Polling the
+        // measured finger speed returns as soon as motion stops -- which covers both "reached the
+        // commanded position" and "stalled against an object" -- so short moves stop costing a
+        // flat two seconds, and success is no longer reported while the fingers are still closing.
+        // The grace period exists because the speed is legitimately zero in the moment between
+        // sending the command and the gripper starting to move.
+        const auto start = std::chrono::steady_clock::now();
+        bool has_moved = false;
+        while (rclcpp::ok()) {
+            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+            float finger_speed;
+            {
+                std::lock_guard<std::mutex> lock(mApiMutex);
+                finger_speed = get_gripper_speed();
+            }
+
+            if (std::abs(finger_speed) > GRIPPER_MOVING_SPEED) {
+                has_moved = true;
+            } else if (has_moved || elapsed > GRIPPER_START_GRACE_S) {
+                // Either the fingers moved and have now stopped, or the grace period expired
+                // without motion (the gripper was already at the commanded position).
+                break;
+            }
+
+            if (elapsed > GRIPPER_SETTLE_TIMEOUT_S) {
+                RCLCPP_WARN(this->get_logger(),
+                    "Gripper still moving after %.1f s -- continuing anyway.", elapsed);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
         result->success = true;
         goal_handle->succeed(result);
     } catch (...) {
@@ -374,8 +692,17 @@ void Controller::publishState()
         auto joints = mBase->GetMeasuredJointAngles();
         float gripper_pos = get_gripper_position();
 
+        // Report the FINGERTIP pose, not the raw firmware TCP. This is the other half of the
+        // compensation applied in execute_pose: because commands and feedback now speak the same
+        // frame, a read-modify-write like move_relative (read robot_state, add a delta, send it
+        // back) stays consistent without the caller knowing any of this exists.
+        // NOTE: this therefore DIVERGES from the Cartesian pose shown in the Kinova Web App by up
+        // to the full fingertip extension (~3 cm) when the gripper is closed. That is intentional --
+        // the Web App reports the firmware tool frame, this topic reports where the fingers are.
+        auto tip = shiftAlongToolZ(cartesian, fingertipExtension(gripper_pos));
+
         auto msg = ros2_interfaces::msg::RobotState();
-        msg.x = cartesian.x(); msg.y = cartesian.y(); msg.z = cartesian.z();
+        msg.x = tip.x(); msg.y = tip.y(); msg.z = tip.z();
         msg.theta_x = cartesian.theta_x(); msg.theta_y = cartesian.theta_y(); msg.theta_z = cartesian.theta_z();
         for (int i = 0; i < 7; ++i) msg.joint_angles[i] = joints.joint_angles(i).value();
         msg.gripper_position = gripper_pos;
