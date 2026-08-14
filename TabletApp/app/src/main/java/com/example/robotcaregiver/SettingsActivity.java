@@ -41,6 +41,7 @@ public class SettingsActivity extends AppCompatActivity {
     private RadioGroup transportGroup;
     private RadioButton radioTcp;
     private RadioButton radioBluetooth;
+    private RadioButton radioBle;
     private View tcpSection;
     private View bluetoothSection;
 
@@ -56,6 +57,7 @@ public class SettingsActivity extends AppCompatActivity {
         transportGroup = findViewById(R.id.transportGroup);
         radioTcp = findViewById(R.id.radioTcp);
         radioBluetooth = findViewById(R.id.radioBluetooth);
+        radioBle = findViewById(R.id.radioBle);
         tcpSection = findViewById(R.id.tcpSection);
         bluetoothSection = findViewById(R.id.bluetoothSection);
         deviceSpinner = findViewById(R.id.deviceSpinner);
@@ -63,6 +65,7 @@ public class SettingsActivity extends AppCompatActivity {
         Button saveButton = findViewById(R.id.saveButton);
 
         if(settings.isBluetooth()) radioBluetooth.setChecked(true);
+        else if(settings.isBle()) radioBle.setChecked(true);
         else radioTcp.setChecked(true);
 
         // Pre-fill existing values so editing is easy.
@@ -80,7 +83,8 @@ public class SettingsActivity extends AppCompatActivity {
 
     private void showRelevantSection(){
         boolean bt = radioBluetooth.isChecked();
-        tcpSection.setVisibility(bt ? View.GONE : View.VISIBLE);
+        boolean ble = radioBle.isChecked();
+        tcpSection.setVisibility(bt | ble ? View.GONE : View.VISIBLE);
         bluetoothSection.setVisibility(bt ? View.VISIBLE : View.GONE);
     }
 
@@ -139,6 +143,9 @@ public class SettingsActivity extends AppCompatActivity {
             settings.setKitMac(deviceMacs.get(pos));
             settings.setTransport(AppSettings.TRANSPORT_BT);
         }
+        else if (radioBle.isChecked()){
+            settings.setTransport(AppSettings.TRANSPORT_BLE);
+        }
         else{
             String host = hostField.getText().toString().trim();
 
@@ -177,6 +184,9 @@ public class SettingsActivity extends AppCompatActivity {
     private void bluetoothPermissionCheck(){
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED){
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 2001);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED){
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.BLUETOOTH_ADVERTISE}, 2002);
         }
     }
 

@@ -1,5 +1,7 @@
 package com.example.robotcaregiver;
 
+import static android.view.View.GONE;
+import static android.view.View.VISIBLE;
 import static com.example.robotcaregiver.BuildConfig.GEMINI_API_KEY;
 
 import android.Manifest;
@@ -9,6 +11,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CountDownTimer;
 import android.speech.RecognizerIntent;
 import android.widget.Button;
 import android.widget.ImageView;
@@ -46,6 +49,9 @@ public class MainActivity extends AppCompatActivity
     private ActivityResultLauncher<Intent> settingsLauncher;
     private String connectedHost;
     private static final int KIT_PORT = 9100;
+    private static final long CONNECT_TIMEOUT = 30_000L;
+    private CountDownTimer connectTimer;
+    private String lastConnectDetail = "";
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -77,7 +83,7 @@ public class MainActivity extends AppCompatActivity
 
         setConnectedUi(false);
         setStatus("Not connected to kit. Tap Connect.");
-        connectToKit();
+//        connectToKit();
     }
 
     private void onSettingsClosed() {
@@ -109,12 +115,50 @@ public class MainActivity extends AppCompatActivity
 
         connectedHost = host;
 
-        kit = settings.isBluetooth() ? new BluetoothKitLink(settings.getKitMac()) : new TcpClientKitLink(host, KIT_PORT);
+        kit = settings.isBluetooth() ? new BluetoothKitLink(settings.getKitMac()) : (settings.isBle() ? new BleKitLink(this) : new TcpClientKitLink(host, KIT_PORT));
         kit.setListener(this);
 
-        setStatus("Connecting to " + host + ": " + KIT_PORT + "...");
-        connectButton.setEnabled(false);
+        startConnectCountdown();
+
         kit.connect();
+    }
+
+    private void startConnectCountdown(){
+        runOnUiThread(() -> {
+            cancelConnectCountdown();
+
+            connectButton.setVisibility(VISIBLE);
+            connectButton.setEnabled(false);
+
+            connectTimer = new CountDownTimer(CONNECT_TIMEOUT, 1000) {
+                @Override
+                public void onTick(long l) {
+                    long secs = (l + 999) / 1000;
+                    statusView.setText("Connection could take " + secs + " s");
+                }
+
+                @Override
+                public void onFinish() {
+                    connectTimer = null;
+                    statusView.setText("Could not connect within 30 seconds. \nTap Connect to try again.");
+                    connectButton.setVisibility(VISIBLE);
+                    connectButton.setEnabled(true);
+
+                    if (kit != null){
+                        kit.setListener(null);
+                        kit.disconnect();
+                        kit.setListener(MainActivity.this);
+                    }
+                }
+            }.start();
+        });
+    }
+
+    private void cancelConnectCountdown(){
+        if (connectTimer != null){
+            connectTimer.cancel();
+            connectTimer = null;
+        }
     }
 
 
@@ -141,8 +185,17 @@ public class MainActivity extends AppCompatActivity
 
     private void setConnectedUi(boolean connected) {
         runOnUiThread(() -> {
-            connectButton.setVisibility(connected ? Button.GONE : Button.VISIBLE);
-            connectButton.setEnabled(true);
+            if(connected){
+                setStatus("Connected to kit!");
+                cancelConnectCountdown();
+                connectButton.setVisibility(GONE);
+            }
+            else if(connectTimer == null){
+                setStatus("Connection to kit lost, please reconnect.");
+                connectButton.setVisibility(VISIBLE);
+                connectButton.setEnabled(true);
+            }
+
             startStopButton.setEnabled(connected);
         });
     }
@@ -167,6 +220,10 @@ public class MainActivity extends AppCompatActivity
                 != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.RECORD_AUDIO);
         }
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_ADVERTISE);
+        }
         if (!needed.isEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), 1001);
         }
@@ -175,6 +232,7 @@ public class MainActivity extends AppCompatActivity
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        cancelConnectCountdown();
         if (kit != null) kit.disconnect();
     }
 }

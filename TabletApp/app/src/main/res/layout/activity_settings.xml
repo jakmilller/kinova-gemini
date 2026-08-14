@@ -44,6 +44,15 @@
             android:textSize="16sp"
             android:layout_marginStart="24dp"
             android:text="Bluetooth"></RadioButton>
+
+        <RadioButton
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:id="@+id/radioBle"
+            android:minHeight="48dp"
+            android:textSize="16sp"
+            android:layout_marginStart="24dp"
+            android:text="BLE"></RadioButton>
     </RadioGroup>
 
     <LinearLayout

@@ -23,6 +23,7 @@ public class AppSettings {
     private static final String KEY_TRANSPORT = "transport";
     public static final String TRANSPORT_TCP = "tcp";
     public static final String TRANSPORT_BT = "bluetooth";
+    public static final String TRANSPORT_BLE = "ble";
 
     private final SharedPreferences prefs;
 
@@ -41,6 +42,10 @@ public class AppSettings {
 
     public boolean isBluetooth() {
         return TRANSPORT_BT.equals(getTransport());
+    }
+
+    public boolean isBle(){
+        return TRANSPORT_BLE.equals(getTransport());
     }
 
     @Nullable
