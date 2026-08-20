@@ -39,7 +39,7 @@ class BLEInterfaceNode(Node):
     def _on_instruction(self, text):
         msg = String()
         msg.data = text
-        self.publisher_.publish(msg)
+        self.publisher.publish(msg)
         dbg_ble(f'Published to /user_instructions: "{text}"')
         self.get_logger().info(f'BLE instruction from phone: "{text}"')
 
