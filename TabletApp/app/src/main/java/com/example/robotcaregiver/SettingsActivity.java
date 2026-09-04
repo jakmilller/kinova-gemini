@@ -1,6 +1,7 @@
 package com.example.robotcaregiver;
 
 import android.Manifest;
+import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.pm.PackageManager;
@@ -103,6 +104,10 @@ public class SettingsActivity extends AppCompatActivity {
             return;
         }
 
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions((Activity) this, new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 2001);
+            return;
+        }
         Set<BluetoothDevice> paired = adapter.getBondedDevices();
         if(paired == null || paired.isEmpty()){
             btHint.setText("No paired devices. Pair the kit in this phone's system BT settings");

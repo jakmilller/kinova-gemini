@@ -13,6 +13,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.speech.RecognizerIntent;
+import android.text.method.ScrollingMovementMethod;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -63,6 +64,8 @@ public class MainActivity extends AppCompatActivity
         settingsButton = findViewById(R.id.settingsButton);
         connectButton = findViewById(R.id.connectButton);
 
+        statusView.setMovementMethod(new ScrollingMovementMethod());
+
         settings = new AppSettings(this);
 
         requestRuntimePermissions();
@@ -81,8 +84,10 @@ public class MainActivity extends AppCompatActivity
         settingsButton.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
         connectButton.setOnClickListener(v -> connectToKit());
 
+        addStatus("set click listeners to buttons");
+
         setConnectedUi(false);
-        setStatus("Not connected to kit. Tap Connect.");
+        addStatus("Not connected to kit. Tap Connect.");
 //        connectToKit();
     }
 
@@ -101,22 +106,35 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void connectToKit(){
+
+        addStatus("called connectToKit");
+
         String host = settings.getKitHost();
-        if(host == null || host.isEmpty()){
-            setStatus("No kit address set. Open Settings and enter the kit's IP.");
-            setConnectedUi(false);
-            return;
+
+        addStatus("got host");
+
+        String type = (settings.isBluetooth() ? "Bluetooth" : (settings.isBle() ? "BLE" : "WiFi"));
+
+        if(type.equals("WiFi")){
+            if(host == null || host.isEmpty()){
+                addStatus("No kit address set. Open Settings and enter the kit's IP.");
+                setConnectedUi(false);
+                return;
+            }
         }
 
         if(kit != null){
             kit.setListener(null);
             kit.disconnect();
+            addStatus("disconnected existing kit");
         }
 
         connectedHost = host;
 
-        kit = settings.isBluetooth() ? new BluetoothKitLink(settings.getKitMac()) : (settings.isBle() ? new BleKitLink(this) : new TcpClientKitLink(host, KIT_PORT));
+        kit = settings.isBluetooth() ? new BluetoothKitLink(settings.getKitMac(), this) : (settings.isBle() ? new BleKitLink(this) : new TcpClientKitLink(host, KIT_PORT));
         kit.setListener(this);
+
+        addStatus("kit connection type: " + type);
 
         startConnectCountdown();
 
@@ -186,15 +204,15 @@ public class MainActivity extends AppCompatActivity
     private void setConnectedUi(boolean connected) {
         runOnUiThread(() -> {
             if(connected){
-                setStatus("Connected to kit!");
+                addStatus("Connected to kit!");
                 cancelConnectCountdown();
                 connectButton.setVisibility(GONE);
             }
-            else if(connectTimer == null){
-                setStatus("Connection to kit lost, please reconnect.");
+//            else if(connectTimer == null){
+//                addStatus("Connection to kit lost, please reconnect.");
                 connectButton.setVisibility(VISIBLE);
                 connectButton.setEnabled(true);
-            }
+//            }
 
             startStopButton.setEnabled(connected);
         });
@@ -202,7 +220,7 @@ public class MainActivity extends AppCompatActivity
 
 
     @Override public void onKitStatus(@NonNull String status) {
-        runOnUiThread(() -> setStatus("Kit: " + status));
+        runOnUiThread(() -> { clearStatus(); setStatus("Kit: " + status); });
     }
 
     @Override public void onKitConnectionChanged(boolean connected, @NonNull String detail) {
@@ -210,8 +228,16 @@ public class MainActivity extends AppCompatActivity
         runOnUiThread(() -> toast(detail));
     }
 
+    @Override public void onDbgMsg(@NonNull String msg){
+        runOnUiThread(() -> addStatus("Dbg: " + msg));
+    }
 
     private void setStatus(@NonNull String text) { statusView.setText(text); }
+
+    private void addStatus(@NonNull String text) { statusView.setText(statusView.getText().toString() + "\n" + text); }
+
+    private void clearStatus(){ statusView.setText(""); }
+
     private void toast(@NonNull String msg) { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show(); }
 
     private void requestRuntimePermissions() {

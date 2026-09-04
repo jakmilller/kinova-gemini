@@ -59,6 +59,17 @@ def rfcomm_accept(server):
     peer = ':'.join(f'{b:02X}' for b in reversed(bytes(addr.rc_bdaddr)))
     return socket.socket(fileno=fd), peer
 
+def find_free_channel(start=1, end=30):
+        for ch in range(start, end + 1):
+            s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            try:
+                s.bind((socket.BDADDR_ANY, ch))
+                s.listen(1)
+                return s, ch
+            except OSError:
+                s.close()
+        raise OSError("No free RFCOMM channel, checked 1-30")
+
 class BluetoothInterfaceNode(Node):
     """
     Tablet does speech-to-text and sends a plain text instruction over bluetooth. This node 
@@ -82,10 +93,12 @@ class BluetoothInterfaceNode(Node):
 
         self.get_logger().info(f'Bluetooth interface node listening on RFCOMM ch {RFCOMM_CHANNEL}')
 
+
     def run_server(self):
 
         try:
-            server = rfcomm_listen(RFCOMM_CHANNEL)
+            server, ch = find_free_channel()
+            self.get_logger().info(f'First available ch: ({ch})')
         except OSError as e:
             self.get_logger().error(f'Cannot make BT socket ({e})')
             return

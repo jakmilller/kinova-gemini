@@ -24,7 +24,8 @@
         android:gravity="top"
         android:textSize="22sp"
         android:textColor="#000000"
-        android:text="" />
+        android:text=""
+        android:scrollbars="vertical"/>
 
     <Button
         android:id="@+id/startStopButton"

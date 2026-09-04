@@ -18,6 +18,7 @@ import android.bluetooth.le.AdvertiseSettings;
 import android.bluetooth.le.BluetoothLeAdvertiser;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.ParcelUuid;
 import android.util.Log;
 
@@ -62,50 +63,100 @@ public class BleKitLink implements KitLink {
 
     @Override
     public void connect(){
+        try{
+            connectInternal();
+        }
+        catch (SecurityException e){
+            notifyConn(false, "Bluetooth permission denied: " + e.getMessage());
+        }
+        catch (Exception e){
+            notifyConn(false, "Couldn't start BLE: " + e.getMessage());
+        }
+    }
+
+    public void connectInternal(){
         BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+
         if(manager == null){
+            notifyDbg("ble manager null!");
             notifyConn(false, "No BLE manager");
             return;
         }
+        notifyDbg("retrieved ble manager");
 
         BluetoothAdapter adapter = manager.getAdapter();
         if(adapter == null || !adapter.isEnabled()){
+            notifyDbg("ble adapter null!");
             notifyConn(false, "Bluetooth is off. Turn it on and retry.");
             return;
         }
+        notifyDbg("retrieved ble adapter");
 
         if(!adapter.isMultipleAdvertisementSupported()){
             Log.w(TAG, "no multi-advertisement supported");
         }
 
-        gattServer = manager.openGattServer(context, serverCallback);
-        if(gattServer == null){
-            notifyConn(false, "Could not open gatt server");
+        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+            notifyDbg("need to grant advertise permission");
+            ActivityCompat.requestPermissions((Activity) context, new String[]{Manifest.permission.BLUETOOTH_ADVERTISE}, 2002);
             return;
         }
 
+        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            notifyDbg("need to grant ble connect permission");
+            ActivityCompat.requestPermissions((Activity) context, new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 2001);
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S){
+            boolean advertiseOk = context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+            boolean connectedOk = context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+
+            if(!advertiseOk || !connectedOk) notifyConn(false, "Missing bluetooth permission" + (advertiseOk ? "" : " ADVERTISE") + (connectedOk ? "" : " CONNECT") + ". Grant permissions in app settings and try again.");
+        }
+
+        gattServer = manager.openGattServer(context, serverCallback);
+        if(gattServer == null){
+            notifyConn(false, "Could not open gatt server");
+            notifyDbg("gattServer null!");
+            return;
+        }
+        notifyDbg("retrieved gattServer");
+
         BluetoothGattService service = new BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+
+        notifyDbg("created ble service");
 
         instructionChar = new BluetoothGattCharacteristic(INSTRUCTION_UUID, BluetoothGattCharacteristic.PROPERTY_NOTIFY, BluetoothGattCharacteristic.PERMISSION_READ);
         BluetoothGattDescriptor cccd = new BluetoothGattDescriptor(CCCD_UUID, BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE);
         instructionChar.addDescriptor(cccd);
         service.addCharacteristic(instructionChar);
 
+        notifyDbg("created instruction characteristic");
+
         statusChar = new BluetoothGattCharacteristic(STATUS_UUID, BluetoothGattCharacteristic.PROPERTY_WRITE | BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE, BluetoothGattCharacteristic.PERMISSION_WRITE);
         service.addCharacteristic(statusChar);
 
+        notifyDbg("created status characteristic");
+
         gattServer.addService(service);
+
+        notifyDbg("added service to gattServer");
 
         advertiser = adapter.getBluetoothLeAdvertiser();
         if(advertiser == null){
+            notifyDbg("ble advertiser null!");
             notifyConn(false, "This device can't advertise over BLE");
             return;
         }
+        notifyDbg("retrieved ble advertiser");
 
         AdvertiseData advertiseData = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .addServiceUuid(new ParcelUuid(SERVICE_UUID))
                 .build();
+
+        notifyDbg("added service to advertiser");
 
         AdvertiseSettings settings = new AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -114,15 +165,16 @@ public class BleKitLink implements KitLink {
                 .setTimeout(0)
                 .build();
 
+        notifyDbg("set advertising latency & power");
+
         AdvertiseData scanResponse = new AdvertiseData.Builder()
                 .setIncludeDeviceName(true)
                 .build();
 
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions((Activity) context, new String[]{Manifest.permission.BLUETOOTH_ADVERTISE}, 2002);
-            return;
-        }
+        notifyDbg("set advertising dev name");
+
         advertiser.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback);
+        notifyDbg("started advertising!");
     }
 
     private final AdvertiseCallback advertiseCallback = new AdvertiseCallback() {
@@ -259,6 +311,10 @@ public class BleKitLink implements KitLink {
 
     private void notifyConn(boolean connected, String msg){
         if (listener != null) listener.onKitConnectionChanged(connected, msg);
+    }
+
+    private void notifyDbg(String msg){
+        if (listener != null) listener.onDbgMsg(msg);
     }
 
 }
